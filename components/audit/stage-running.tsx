@@ -4,22 +4,37 @@ import { useEffect, useRef, useState } from "react";
 import { Badge, Button, Card, CardHeader } from "@/components/primitives";
 import { cn } from "@/lib/cn";
 import { ReportTabs } from "@/components/report-tabs";
-import { REMEDIATION, ROOT_CAUSE } from "@/lib/data";
 import {
   runStage1,
   runStage2Stream,
-  runStage3,
+  runStage3Stream,
   runStage4,
+  runStage5,
+  runStage6,
   type Stage1Fingerprint,
   type Stage1Response,
   type Stage2Model,
   type Stage3Response,
   type Stage3Model,
+  type Stage3PairwiseTest,
   type Stage4Response,
   type Stage4Model,
+  type Stage5Response,
+  type Stage5PerAttr,
+  type Stage5ProxyFeature,
+  type Stage5CorrFeature,
+  type Stage6Response,
+  type Stage6Action,
+  type Stage6ActionStatus,
 } from "@/lib/api";
 import type { ParsedCsv } from "@/lib/csv";
 import type { AuditConfig } from "./stage-configure";
+import {
+  formatGroup,
+  attrLabel,
+  shortLabel,
+  UNKNOWN_MAPPING_HINT,
+} from "@/lib/labels";
 
 type StageCtx = { csv: ParsedCsv; cfg: AuditConfig; data: StageData };
 
@@ -42,11 +57,30 @@ type Stage2Live = {
   complete: boolean;
 };
 
+/** Stage 3 progressive view — same shape as Stage3Response, plus a per-model
+ *  status flag so the UI can show "running" placeholders before each model's
+ *  fairness audit finishes. `complete` flips true on the `done` event. */
+type Stage3LiveModel = Stage3Model & { status: "running" | "done" | "error" };
+type Stage3Live = {
+  session_id: string;
+  n_total: number;
+  bootstrap_n: number;
+  pairwise_tests: Stage3PairwiseTest[];
+  results: {
+    protected: string;
+    groups: string[];
+    models: Stage3LiveModel[];
+  }[];
+  complete: boolean;
+};
+
 type StageData = {
   stage1?: Stage1Response;
   stage2?: Stage2Live;
-  stage3?: Stage3Response;
+  stage3?: Stage3Live;
   stage4?: Stage4Response;
+  stage5?: Stage5Response;
+  stage6?: Stage6Response;
 };
 
 type StageDef = {
@@ -109,22 +143,24 @@ const PIPELINE: StageDef[] = [
     id: 3,
     name: "Per-model fairness audit",
     desc: "Per-group TPR, FPR, AUC, selection rate with bootstrap CIs and equalized-odds / demographic-parity gaps.",
-    meta: "BOOTSTRAP · LIVE BACKEND",
+    meta: "BOOTSTRAP · STREAMED · LIVE BACKEND",
     duration: 1200,
     finding: ({ data }) => {
       const r = data.stage3;
       if (!r) return "Fairness metrics computed";
       const attrs = r.results.length;
-      const nModels = r.results[0]?.models.length ?? 0;
-      const totalCells = r.results.reduce(
-        (s, x) => s + x.models.length * Object.keys(x.models[0]?.by_group ?? {}).length,
-        0
-      );
+      const doneModels =
+        r.results[0]?.models.filter((m) => m.status === "done").length ?? 0;
+      const totalModels = r.results[0]?.models.length ?? 0;
       const eoGaps = r.results.flatMap((x) =>
-        x.models.map((m) => m.gaps.eo_gap).filter((v): v is number => v != null)
+        x.models
+          .filter((m) => m.status === "done")
+          .map((m) => m.gaps.eo_gap)
+          .filter((v): v is number => v != null)
       );
       const worst = eoGaps.length > 0 ? Math.max(...eoGaps) : null;
-      return `${attrs} attribute${attrs > 1 ? "s" : ""} × ${nModels} models · ${totalCells} group cells · bootstrap n=${r.bootstrap_n}${worst != null ? ` · worst EO Δ ${(worst * 100).toFixed(1)}pp` : ""}`;
+      const sigPairs = r.pairwise_tests?.filter((t) => t.significant_auc || t.significant_errors).length ?? 0;
+      return `${attrs} attribute${attrs > 1 ? "s" : ""} × ${doneModels}/${totalModels} models · bootstrap n=${r.bootstrap_n}${worst != null ? ` · worst EO Δ ${(worst * 100).toFixed(1)}pp` : ""}${sigPairs > 0 ? ` · ${sigPairs} sig. pairwise tests` : ""}`;
     },
   },
   {
@@ -148,18 +184,34 @@ const PIPELINE: StageDef[] = [
   {
     id: 5,
     name: "Root cause diagnosis",
-    desc: "SHAP cross-group analysis fed into a 5-class Bayesian classifier.",
-    meta: "5-CLASS BAYESIAN",
-    duration: 1300,
-    finding: () => "Proxy discrimination · 73% confidence",
+    desc: "SHAP feature attribution per group, proxy discrimination detection, counterfactual flip test, and Bayesian 5-class root cause posterior.",
+    meta: "SHAP · PERMUTATION · BAYESIAN · LIVE BACKEND",
+    duration: 2000,
+    finding: ({ data }) => {
+      const r = data.stage5;
+      if (!r) return "Root cause diagnosed";
+      const cause = r.primary_root_cause?.replace(/_/g, " ") ?? "unknown";
+      const firstAttr = r.results ? Object.values(r.results)[0] : null;
+      const conf = firstAttr?.bayesian_root_cause?.[r.primary_root_cause ?? ""];
+      const pct = conf != null ? `${(conf * 100).toFixed(0)}%` : null;
+      const flip = firstAttr?.counterfactual_flip_rate;
+      return `${cause}${pct ? ` · ${pct} confidence` : ""}${r.shap_available ? " · SHAP validated" : " · correlation-based"}${flip != null ? ` · flip rate ${(flip * 100).toFixed(1)}%` : ""}`;
+    },
   },
   {
     id: 6,
     name: "Guided remediation",
     desc: "Root-cause-conditional fixes, validated as Pareto improvements.",
-    meta: "BOOTSTRAP-VALIDATED",
+    meta: "CONDITIONAL RULES · LIVE BACKEND",
     duration: 900,
-    finding: () => "Threshold adjustment blocked · feature decorrelation recommended",
+    finding: ({ data }) => {
+      const r = data.stage6;
+      if (!r) return "Remediation plan generated";
+      const rec = r.actions.filter((a) => a.status === "recommended").length;
+      const blocked = r.actions.filter((a) => a.status === "blocked").length;
+      const safeTxt = r.safe_to_auto_fix ? "safe to apply" : "manual review required";
+      return `${r.diagnosis}${blocked > 0 ? ` · ${blocked} intervention${blocked > 1 ? "s" : ""} blocked` : ""}${rec > 0 ? ` · ${rec} recommended` : ""} · ${safeTxt}`;
+    },
   },
   {
     id: 7,
@@ -196,6 +248,9 @@ export function RunningStage({
   const [findings, setFindings] = useState<Record<number, string>>({});
   const [data, setData] = useState<StageData>({});
   const [error, setError] = useState<string | null>(null);
+  // Stages the user has already completed at least once — drives clickable
+  // navigation back to past artifacts without re-running the backend.
+  const [completedIndices, setCompletedIndices] = useState<Set<number>>(new Set());
   const totalRunningMsRef = useRef(0);
   const stageStartedAtRef = useRef<number | null>(null);
 
@@ -283,13 +338,91 @@ export function RunningStage({
           if (!data.stage2?.session_id) {
             throw new Error("Stage 3 requires Stage 2 to have completed first");
           }
-          const [stage3] = await Promise.all([
-            runStage3(data.stage2.session_id, controller.signal),
-            new Promise<void>((r) => setTimeout(r, stage.duration)),
-          ]);
+          // Streamed audit — render each model as it completes, mirroring Stage 2.
+          let snap: Stage3Live | null = null;
+          const minDuration = new Promise<void>((r) =>
+            setTimeout(r, stage.duration)
+          );
+          const stream = runStage3Stream(
+            data.stage2.session_id,
+            (ev) => {
+              if (cancelled) return;
+              if (ev.event === "init") {
+                snap = {
+                  session_id: ev.session_id,
+                  n_total: ev.n_total,
+                  bootstrap_n: ev.bootstrap_n,
+                  pairwise_tests: [],
+                  results: ev.results.map((r) => ({
+                    protected: r.protected,
+                    groups: r.groups,
+                    // Placeholder Stage3LiveModel — fields filled in on model_done.
+                    models: r.models.map((m) => ({
+                      key: m.key as Stage3Model["key"],
+                      name: m.name,
+                      family: m.family,
+                      color: m.color,
+                      status: "running" as const,
+                      overall_auc: null,
+                      overall_auc_ci: [null, null],
+                      ece: null,
+                      by_group: {},
+                      gaps: {
+                        tpr_gap: null,
+                        fpr_gap: null,
+                        eo_gap: null,
+                        dp_gap: null,
+                        di_ratio: null,
+                        ppv_gap: null,
+                      },
+                    })),
+                  })),
+                  complete: false,
+                };
+              } else if (ev.event === "model_done" && snap) {
+                if ("error" in ev && ev.error) {
+                  snap = {
+                    ...snap,
+                    results: snap.results.map((r) => ({
+                      ...r,
+                      models: r.models.map((m) =>
+                        m.key === ev.model_key ? { ...m, status: "error" as const } : m
+                      ),
+                    })),
+                  };
+                } else if ("model" in ev && ev.model) {
+                  const protectedAttr = (ev as { protected: string }).protected;
+                  snap = {
+                    ...snap,
+                    results: snap.results.map((r) =>
+                      r.protected === protectedAttr
+                        ? {
+                            ...r,
+                            models: r.models.map((m) =>
+                              m.key === ev.model_key
+                                ? { ...ev.model, status: "done" as const }
+                                : m
+                            ),
+                          }
+                        : r
+                    ),
+                  };
+                }
+              } else if (ev.event === "pairwise_done" && snap) {
+                snap = { ...snap, pairwise_tests: ev.tests };
+              } else if (ev.event === "done" && snap) {
+                snap = { ...snap, complete: true };
+              }
+              if (snap) {
+                const next = snap;
+                setData((d) => ({ ...d, stage3: next }));
+              }
+            },
+            controller.signal
+          );
+          await Promise.all([stream, minDuration]);
           if (cancelled) return;
-          setData((d) => ({ ...d, stage3 }));
-          finalize({ ...data, stage3 });
+          finalize({ ...data, stage3: snap ?? undefined });
         } else if (stage.id === 4) {
           if (!data.stage2?.session_id) {
             throw new Error("Stage 4 requires Stage 2 to have completed first");
@@ -301,6 +434,35 @@ export function RunningStage({
           if (cancelled) return;
           setData((d) => ({ ...d, stage4 }));
           finalize({ ...data, stage4 });
+        } else if (stage.id === 5) {
+          if (!data.stage2?.session_id) {
+            throw new Error("Stage 5 requires Stage 2 to have completed first");
+          }
+          // Pass the recommended model key from Stage 4 if available
+          const recKey = data.stage4?.results?.[0]?.models?.find(
+            (m) => m.recommended
+          )?.key;
+          const [stage5] = await Promise.all([
+            runStage5(data.stage2.session_id, recKey, controller.signal),
+            new Promise<void>((r) => setTimeout(r, stage.duration)),
+          ]);
+          if (cancelled) return;
+          setData((d) => ({ ...d, stage5 }));
+          finalize({ ...data, stage5 });
+        } else if (stage.id === 6) {
+          if (!data.stage2?.session_id) {
+            throw new Error("Stage 6 requires Stage 2 to have completed first");
+          }
+          if (!data.stage5) {
+            throw new Error("Stage 6 requires Stage 5 to have completed first");
+          }
+          const [stage6] = await Promise.all([
+            runStage6(data.stage2.session_id, data.stage5, controller.signal),
+            new Promise<void>((r) => setTimeout(r, stage.duration)),
+          ]);
+          if (cancelled) return;
+          setData((d) => ({ ...d, stage6 }));
+          finalize({ ...data, stage6 });
         } else {
           await new Promise<void>((r) => setTimeout(r, stage.duration));
           if (cancelled) return;
@@ -324,7 +486,16 @@ export function RunningStage({
         ...f,
         [currentIdx]: stage.finding({ csv, cfg, data: nextData }),
       }));
-      totalRunningMsRef.current += stage.duration;
+      // Only count execution time on first completion — re-views shouldn't inflate the total.
+      if (!completedIndices.has(currentIdx)) {
+        totalRunningMsRef.current += stage.duration;
+      }
+      setCompletedIndices((s) => {
+        if (s.has(currentIdx)) return s;
+        const next = new Set(s);
+        next.add(currentIdx);
+        return next;
+      });
       setStatus("complete");
     }
 
@@ -351,9 +522,29 @@ export function RunningStage({
       onComplete(totalRunningMsRef.current / 1000);
       return;
     }
-    setCurrentIdx(currentIdx + 1);
-    setStatus("idle");
-    setStageElapsedMs(0);
+    const nextIdx = currentIdx + 1;
+    setCurrentIdx(nextIdx);
+    setError(null);
+    // If the user has already completed this stage on a prior pass, jump straight
+    // to its artifact view rather than asking them to re-run it.
+    if (completedIndices.has(nextIdx)) {
+      setStatus("complete");
+      setStageElapsedMs(PIPELINE[nextIdx].duration);
+    } else {
+      setStatus("idle");
+      setStageElapsedMs(0);
+    }
+  }
+
+  /** Jump back (or forward) to an already-completed stage to re-view its artifact.
+   *  Does not re-run the backend — the cached artifact in `data` is what's shown. */
+  function jumpToStage(idx: number) {
+    if (idx === currentIdx) return;
+    if (!completedIndices.has(idx)) return;
+    setCurrentIdx(idx);
+    setStatus("complete");
+    setStageElapsedMs(PIPELINE[idx].duration);
+    setError(null);
   }
 
   return (
@@ -391,7 +582,12 @@ export function RunningStage({
       </div>
 
       {/* Pipeline rail */}
-      <PipelineRail currentIdx={currentIdx} status={status} />
+      <PipelineRail
+        currentIdx={currentIdx}
+        status={status}
+        completedIndices={completedIndices}
+        onJumpTo={jumpToStage}
+      />
 
       {/* Stage card */}
       <Card className="mt-6">
@@ -434,7 +630,8 @@ export function RunningStage({
 
           {/* Body */}
           {status === "idle" && <RunPrompt onRun={runStage} stageId={stage.id} />}
-          {status === "running" && stage.id === 2 && data.stage2 ? (
+          {status === "running" &&
+          ((stage.id === 2 && data.stage2) || (stage.id === 3 && data.stage3)) ? (
             <StageArtifact stageId={stage.id} csv={csv} cfg={cfg} data={data} />
           ) : status === "running" ? (
             <RunningBody stageId={stage.id} />
@@ -460,6 +657,34 @@ export function RunningStage({
 
       {/* CTA row */}
       <div className="mt-6 flex flex-wrap items-center gap-3 justify-end">
+        {/* When the user is re-viewing a past stage, offer a quick jump back to
+            the furthest stage they've reached (the "live" tip of the pipeline). */}
+        {(() => {
+          const furthestCompleted =
+            completedIndices.size > 0 ? Math.max(...completedIndices) : -1;
+          const liveIdx = Math.min(furthestCompleted + 1, PIPELINE.length - 1);
+          const isReviewing =
+            currentIdx < liveIdx && completedIndices.has(currentIdx);
+          if (!isReviewing) return null;
+          return (
+            <Button
+              variant="ghost"
+              size="md"
+              onClick={() => {
+                if (completedIndices.has(liveIdx)) {
+                  jumpToStage(liveIdx);
+                } else {
+                  setCurrentIdx(liveIdx);
+                  setStatus("idle");
+                  setStageElapsedMs(0);
+                  setError(null);
+                }
+              }}
+            >
+              ← Jump to current · Stage {liveIdx + 1}
+            </Button>
+          );
+        })()}
         {status === "idle" && (
           <Button variant="primary" size="md" onClick={runStage}>
             Run stage {stage.id}
@@ -493,26 +718,34 @@ export function RunningStage({
 function PipelineRail({
   currentIdx,
   status,
+  completedIndices,
+  onJumpTo,
 }: {
   currentIdx: number;
   status: StageStatus;
+  completedIndices: Set<number>;
+  onJumpTo: (idx: number) => void;
 }) {
   return (
     <div className="rounded-lg border border-hairline bg-surface/60 px-4 py-4">
       <ol className="grid grid-cols-4 sm:grid-cols-8 gap-2">
         {PIPELINE.map((s, i) => {
-          const state =
-            i < currentIdx
-              ? "done"
-              : i === currentIdx
-              ? status === "complete"
-                ? "done"
-                : status === "running"
+          const isCurrent = i === currentIdx;
+          let state: "done" | "running" | "current" | "pending";
+          if (isCurrent) {
+            state =
+              status === "running"
                 ? "running"
-                : "current"
-              : "pending";
-          return (
-            <li key={s.id} className="flex items-center gap-2 min-w-0">
+                : status === "complete"
+                ? "done"
+                : "current";
+          } else {
+            state = completedIndices.has(i) ? "done" : "pending";
+          }
+          // Clickable: any completed stage that isn't already the current one.
+          const clickable = !isCurrent && completedIndices.has(i);
+          const inner = (
+            <>
               <RailGlyph state={state} index={s.id} />
               <div className="min-w-0 hidden sm:block">
                 <div
@@ -532,10 +765,40 @@ function PipelineRail({
                   {s.name}
                 </div>
               </div>
+            </>
+          );
+          return (
+            <li
+              key={s.id}
+              className={cn(
+                "flex items-center gap-2 min-w-0 rounded-md transition-colors",
+                isCurrent && "ring-1 ring-accent/40 bg-accent-soft/20 px-1.5 py-1 -mx-1.5 -my-1"
+              )}
+            >
+              {clickable ? (
+                <button
+                  type="button"
+                  onClick={() => onJumpTo(i)}
+                  title={`Re-view Stage ${s.id} — ${s.name}`}
+                  className="flex items-center gap-2 min-w-0 w-full rounded-md hover:bg-elevated/70 transition-colors cursor-pointer text-left -mx-1 px-1 py-0.5"
+                >
+                  {inner}
+                </button>
+              ) : (
+                <div className="flex items-center gap-2 min-w-0 w-full">
+                  {inner}
+                </div>
+              )}
             </li>
           );
         })}
       </ol>
+      {/* Hint about navigation, only shown once anything is completed */}
+      {completedIndices.size > 0 && (
+        <div className="mt-3 text-2xs font-mono text-ink-faint uppercase tracking-wider">
+          Tip · click any completed stage to re-view its artifact
+        </div>
+      )}
     </div>
   );
 }
@@ -663,12 +926,20 @@ function StageArtifact({
     if (!data.stage3) return null;
     return <FairnessArtifact response={data.stage3} />;
   }
+  // Stage 3 streamed snapshots are also Stage3Response-shaped so downstream
+  // stages that read it stay compatible.
   if (stageId === 4) {
     if (!data.stage4) return null;
     return <ParetoArtifact response={data.stage4} />;
   }
-  if (stageId === 5) return <RootCauseArtifact cfg={cfg} />;
-  if (stageId === 6) return <RemediationArtifact />;
+  if (stageId === 5) {
+    if (!data.stage5) return null;
+    return <RootCauseArtifact response={data.stage5} cfg={cfg} />;
+  }
+  if (stageId === 6) {
+    if (!data.stage6) return null;
+    return <RemediationArtifact response={data.stage6} />;
+  }
   if (stageId === 7) return <GeminiArtifact />;
   if (stageId === 8) return <ReportTabs />;
   return null;
@@ -687,6 +958,31 @@ function BiasFingerprintArtifact({
   if (response.results.length === 0) return null;
   return (
     <div className="space-y-8">
+      {/* Data handling & assumptions — surfaced up front so users trust the pipeline */}
+      <div className="rounded-md border border-hairline bg-elevated/40 px-4 py-3 text-xs text-ink-muted leading-relaxed">
+        <span className="text-ink font-medium">How this audit handles your data: </span>
+        <ul className="mt-1.5 ml-1 space-y-0.5">
+          <li>
+            <span className="text-ink">Classification only.</span>{" "}
+            Targets are treated as a binary or categorical label (you set the positive class
+            in Step 2). Continuous regression targets aren't supported in this version.
+          </li>
+          <li>
+            <span className="text-ink">Protected attributes are categorical.</span>{" "}
+            Numeric columns like <span className="font-mono">age</span> aren't auto-binned —
+            convert to a categorical column upstream if you want group-level analysis on it.
+          </li>
+          <li>
+            <span className="text-ink">Missing values.</span>{" "}
+            Rows with a missing protected-attribute value are dropped from per-group statistics.
+            Missing feature values are imputed by the model's preprocessing pipeline (column median).
+          </li>
+          <li>
+            <span className="text-ink">Small subgroups</span> (n &lt; {response.results[0]?.fingerprint.n_threshold ?? 100})
+            are flagged in yellow — bootstrap confidence intervals on those groups will be unreliable.
+          </li>
+        </ul>
+      </div>
       {response.results.map((r, i) => (
         <div key={r.protected} className="space-y-3">
           {response.results.length > 1 && (
@@ -745,10 +1041,26 @@ function FingerprintPanel({
             const sharePct = (g.n / groupTotal) * 100;
             const posPct = g.positive_rate != null ? g.positive_rate * 100 : null;
             const gap = g.base_rate_gap;
+            const fmt = formatGroup(protectedName, g.name);
             return (
               <div key={g.name}>
                 <div className="flex items-baseline justify-between text-xs mb-1">
-                  <span className="text-ink">{g.name}</span>
+                  <span className="text-ink" title={fmt.full}>
+                    {fmt.display ?? g.name}
+                    {fmt.display && (
+                      <span className="ml-1.5 text-ink-faint font-mono text-2xs">
+                        ({protectedName} = {g.name})
+                      </span>
+                    )}
+                    {!fmt.known && (
+                      <span
+                        className="ml-1.5 text-ink-faint text-2xs"
+                        title={UNKNOWN_MAPPING_HINT}
+                      >
+                        ⓘ
+                      </span>
+                    )}
+                  </span>
                   <span className="font-mono tabular text-ink-dim">
                     {g.n.toLocaleString()}{" "}
                     <span className="text-ink-faint">· {sharePct.toFixed(1)}%</span>
@@ -879,10 +1191,13 @@ function FingerprintPanel({
               {result.groups.map((g) => {
                 const v = g.missing_rate ?? 0;
                 const pct = v * 100;
+                const fmt = formatGroup(protectedName, g.name);
                 return (
                   <div key={g.name}>
                     <div className="flex items-baseline justify-between text-xs mb-1">
-                      <span className="text-ink-muted">{g.name}</span>
+                      <span className="text-ink-muted" title={fmt.full}>
+                        {fmt.display ?? g.name}
+                      </span>
                       <span className="font-mono tabular text-ink-dim">
                         {pct.toFixed(2)}%
                       </span>
@@ -1151,9 +1466,22 @@ function ModelStatusGlyph({ status }: { status: Stage2Model["status"] }) {
    Real data: TPR/FPR/AUC by group, equalized-odds & demographic-parity gaps,
    bootstrap CIs. Computed by Flask /api/audit/stage/3. */
 
-function FairnessArtifact({ response }: { response: Stage3Response }) {
+function FairnessArtifact({ response }: { response: Stage3Live }) {
+  const totalModels = response.results[0]?.models.length ?? 0;
+  const doneModels =
+    response.results[0]?.models.filter((m) => m.status === "done").length ?? 0;
   return (
     <div className="space-y-8">
+      {/* Stream progress chip — shown while models are still auditing */}
+      {!response.complete && (
+        <div className="flex items-center gap-2 text-2xs font-mono uppercase tracking-wider text-ink-dim">
+          <span className="relative w-2 h-2 inline-block">
+            <span className="absolute inset-0 rounded-full bg-accent/30 animate-ping" />
+            <span className="absolute inset-0 rounded-full bg-accent" />
+          </span>
+          {doneModels}/{totalModels} models audited · bootstrap n={response.bootstrap_n.toLocaleString()}
+        </div>
+      )}
       {response.results.map((attr, i) => (
         <div key={attr.protected} className="space-y-3">
           {response.results.length > 1 && (
@@ -1172,15 +1500,25 @@ function FairnessArtifact({ response }: { response: Stage3Response }) {
           <FairnessTable attr={attr} />
         </div>
       ))}
+      {response.pairwise_tests && response.pairwise_tests.length > 0 && (
+        <PairwiseTestsTable
+          tests={response.pairwise_tests}
+          predictions={response.results[0]?.models ?? []}
+        />
+      )}
     </div>
   );
 }
 
-function FairnessTable({ attr }: { attr: Stage3Response["results"][number] }) {
-  const sorted = [...attr.models].sort(
-    (a, b) => (b.overall_auc ?? 0) - (a.overall_auc ?? 0)
-  );
+function FairnessTable({ attr }: { attr: Stage3Live["results"][number] }) {
+  // Sort: completed models first by AUC, running models last in their original order.
+  const sorted = [...attr.models].sort((a, b) => {
+    if (a.status === "running" && b.status !== "running") return 1;
+    if (b.status === "running" && a.status !== "running") return -1;
+    return (b.overall_auc ?? 0) - (a.overall_auc ?? 0);
+  });
   const groups = attr.groups;
+  const protectedName = attr.protected;
 
   return (
     <div className="overflow-x-auto rounded-md border border-hairline">
@@ -1189,20 +1527,31 @@ function FairnessTable({ attr }: { attr: Stage3Response["results"][number] }) {
           <tr className="text-2xs uppercase tracking-[0.16em] text-ink-dim border-b border-hairline">
             <th className="text-left font-normal py-3 pl-4 pr-3">Model</th>
             <th className="text-right font-normal py-3 px-3">AUC overall</th>
-            {groups.map((g) => (
-              <th
-                key={g}
-                className="text-right font-normal py-3 px-3"
-                title={`AUC for group ${g}`}
-              >
-                AUC · {g}
-              </th>
-            ))}
+            {groups.map((g) => {
+              const fmt = formatGroup(protectedName, g);
+              const display = shortLabel(protectedName, g);
+              return (
+                <th
+                  key={g}
+                  className="text-right font-normal py-3 px-3"
+                  title={`AUC for ${fmt.full}`}
+                >
+                  AUC · {display}
+                  {fmt.known && (
+                    <div className="text-ink-faint text-2xs font-mono normal-case tracking-normal">
+                      {protectedName}={g}
+                    </div>
+                  )}
+                </th>
+              );
+            })}
             <th className="text-right font-normal py-3 px-3" title="max−min TPR across groups">TPR Δ</th>
             <th className="text-right font-normal py-3 px-3" title="max−min FPR across groups">FPR Δ</th>
             <th className="text-right font-normal py-3 px-3" title="max(TPR Δ, FPR Δ)">EO Δ</th>
             <th className="text-right font-normal py-3 px-3" title="max−min selection rate">DP Δ</th>
-            <th className="text-right font-normal py-3 px-3 pr-4" title="min/max selection rate; 4/5 rule = 0.80">DI ratio</th>
+            <th className="text-right font-normal py-3 px-3" title="max−min PPV (precision) across groups">PPV Δ</th>
+            <th className="text-right font-normal py-3 px-3" title="min/max selection rate; 4/5 rule = 0.80">DI ratio</th>
+            <th className="text-right font-normal py-3 px-3 pr-4" title="Expected Calibration Error — lower is better">ECE</th>
           </tr>
         </thead>
         <tbody>
@@ -1219,7 +1568,7 @@ function FairnessRow({
   model,
   groups,
 }: {
-  model: Stage3Model;
+  model: Stage3LiveModel;
   groups: string[];
 }) {
   const color = MODEL_COLOR[model.color] ?? MODEL_COLOR.m1;
@@ -1229,6 +1578,44 @@ function FairnessRow({
   const fprΔ = model.gaps.fpr_gap;
   const di = model.gaps.di_ratio;
   const degeneracy = degenerateClassifier(model, groups);
+  const isRunning = model.status === "running";
+  const isError = model.status === "error";
+
+  // Streaming: render a slim placeholder row while the model's audit is in flight.
+  if (isRunning || isError) {
+    const span = 8 + groups.length; // total columns in the table
+    return (
+      <tr className="border-b border-hairline last:border-0">
+        <td className="py-3 pl-4 pr-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <span
+              className="w-2 h-2 rounded-full shrink-0"
+              style={{ background: color }}
+            />
+            <div className="min-w-0">
+              <span className="font-medium truncate">{model.name}</span>
+              <div className="text-2xs text-ink-dim font-mono truncate">
+                {model.family}
+              </div>
+            </div>
+          </div>
+        </td>
+        <td colSpan={span} className="py-3 px-3 text-2xs font-mono uppercase tracking-wider">
+          {isRunning ? (
+            <span className="inline-flex items-center gap-2 text-ink-dim">
+              <span className="relative w-2 h-2 inline-block">
+                <span className="absolute inset-0 rounded-full bg-accent/30 animate-ping" />
+                <span className="absolute inset-0 rounded-full bg-accent" />
+              </span>
+              auditing fairness · bootstrap CIs running…
+            </span>
+          ) : (
+            <span className="text-danger">audit failed</span>
+          )}
+        </td>
+      </tr>
+    );
+  }
 
   return (
     <tr className="border-b border-hairline last:border-0">
@@ -1281,12 +1668,24 @@ function FairnessRow({
       <td className="py-3 px-3 text-right font-mono">
         <GapCell value={dp} threshold={0.1} />
       </td>
-      <td className="py-3 px-3 pr-4 text-right font-mono">
+      <td className="py-3 px-3 text-right font-mono">
+        <GapCell value={model.gaps.ppv_gap} threshold={0.1} />
+      </td>
+      <td className="py-3 px-3 text-right font-mono">
         {di == null ? (
           <span className="text-ink-dim">—</span>
         ) : (
           <span className={cn(di < 0.8 ? "text-warning" : "text-ink")}>
             {di.toFixed(2)}
+          </span>
+        )}
+      </td>
+      <td className="py-3 px-3 pr-4 text-right font-mono">
+        {model.ece == null ? (
+          <span className="text-ink-dim">—</span>
+        ) : (
+          <span className={cn(model.ece > 0.1 ? "text-warning" : "text-ink")}>
+            {model.ece.toFixed(3)}
           </span>
         )}
       </td>
@@ -1387,13 +1786,131 @@ function GapCell({
   );
 }
 
+/* Pairwise statistical tests table — McNemar (error disagreement) + DeLong (AUC). */
+
+const MODEL_NAME_MAP = (models: Stage3Model[], key: string) =>
+  models.find((m) => m.key === key)?.name ?? key;
+
+function PairwiseTestsTable({
+  tests,
+  predictions,
+}: {
+  tests: Stage3PairwiseTest[];
+  predictions: Stage3Model[];
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+          Pairwise model tests
+        </div>
+        <div className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+          BH FDR q = 0.05 · McNemar (errors) · DeLong (AUC)
+        </div>
+      </div>
+      <div className="overflow-x-auto rounded-md border border-hairline">
+        <table className="w-full text-sm tabular">
+          <thead>
+            <tr className="text-2xs uppercase tracking-[0.16em] text-ink-dim border-b border-hairline">
+              <th className="text-left font-normal py-2.5 pl-4 pr-3">Model A</th>
+              <th className="text-left font-normal py-2.5 px-3">Model B</th>
+              <th className="text-right font-normal py-2.5 px-3" title="McNemar p-value (raw)">McNemar p</th>
+              <th className="text-right font-normal py-2.5 px-3" title="McNemar p after BH FDR correction">McNemar p adj</th>
+              <th className="text-right font-normal py-2.5 px-3" title="DeLong AUC difference p-value (raw)">DeLong p</th>
+              <th className="text-right font-normal py-2.5 px-3 pr-4" title="DeLong p after BH FDR correction">DeLong p adj</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tests.map((t) => {
+              const nameA = MODEL_NAME_MAP(predictions, t.model_a);
+              const nameB = MODEL_NAME_MAP(predictions, t.model_b);
+              return (
+                <tr
+                  key={`${t.model_a}-${t.model_b}`}
+                  className={cn(
+                    "border-b border-hairline last:border-0",
+                    (t.significant_errors || t.significant_auc) && "bg-warning/[0.04]"
+                  )}
+                >
+                  <td className="py-2.5 pl-4 pr-3 text-xs font-medium text-ink">{nameA}</td>
+                  <td className="py-2.5 px-3 text-xs font-medium text-ink">{nameB}</td>
+                  <td className="py-2.5 px-3 text-right font-mono text-xs">
+                    <PvalCell value={t.mcnemar_p} />
+                  </td>
+                  <td className="py-2.5 px-3 text-right font-mono text-xs">
+                    <PvalCell value={t.mcnemar_p_adj} significant={t.significant_errors} />
+                  </td>
+                  <td className="py-2.5 px-3 text-right font-mono text-xs">
+                    <PvalCell value={t.delong_p} />
+                  </td>
+                  <td className="py-2.5 px-3 pr-4 text-right font-mono text-xs">
+                    <PvalCell value={t.delong_p_adj} significant={t.significant_auc} />
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function PvalCell({ value, significant }: { value: number | null; significant?: boolean }) {
+  if (value == null) return <span className="text-ink-dim">—</span>;
+  const cls =
+    significant ? "text-warning font-medium" :
+    value < 0.05 ? "text-warning" :
+    "text-ink";
+  return (
+    <span className={cls}>
+      {value < 0.001 ? "<0.001" : value.toFixed(3)}
+      {significant && <span className="ml-1 text-2xs">*</span>}
+    </span>
+  );
+}
+
 /* Stage 4 — Pareto frontier per protected attribute. AUC (X) vs equalized
    odds gap (Y, lower=fairer). Dominated models are dimmed; the recommended
    pick is highlighted. */
 
 function ParetoArtifact({ response }: { response: Stage4Response }) {
+  const thresholdPct = (response.eo_gap_threshold * 100).toFixed(0);
   return (
     <div className="space-y-8">
+      {/* Decision-rule explainer — three-step rule with threshold guardrail */}
+      <div className="rounded-md border border-accent/20 bg-accent-soft/30 px-5 py-4 text-xs text-ink leading-relaxed">
+        <div className="font-mono uppercase tracking-[0.18em] text-2xs text-accent mb-2">
+          How a model is chosen
+        </div>
+        <ol className="space-y-1.5 list-decimal list-inside marker:text-accent marker:font-mono">
+          <li>
+            <span className="text-ink font-medium">Pareto filter.</span>{" "}
+            Drop any model that's beaten on{" "}
+            <em className="not-italic text-ink">both</em> accuracy (AUC) and
+            fairness (equalized-odds gap) by some other model — those are{" "}
+            <span className="text-danger font-medium">dominated</span> and can't be
+            optimal under any preference.
+          </li>
+          <li>
+            <span className="text-ink font-medium">Fairness threshold.</span>{" "}
+            Disqualify any survivor whose EO gap exceeds{" "}
+            <span className="font-mono">{thresholdPct}pp</span> — fairness is a
+            constraint here, not just a tiebreaker. A high-AUC model that fails
+            this guardrail is{" "}
+            <span className="text-warning font-medium">not</span> recommended.
+          </li>
+          <li>
+            <span className="text-ink font-medium">Highest accuracy wins.</span>{" "}
+            Among models that pass both filters, pick the one with the highest
+            AUC. That's the{" "}
+            <span className="text-success font-medium">recommended</span> model.
+          </li>
+        </ol>
+        <div className="mt-2.5 text-2xs text-ink-muted font-mono">
+          Composite ranking inside the qualifying set: <span className="text-ink">Score = AUC − {response.lambda_param.toFixed(1)}·EO_gap</span> · higher is better.
+        </div>
+      </div>
       {response.results.map((attr, i) => (
         <div key={attr.protected} className="space-y-3">
           {response.results.length > 1 && (
@@ -1409,9 +1926,109 @@ function ParetoArtifact({ response }: { response: Stage4Response }) {
               </div>
             </div>
           )}
-          <ParetoPanel attr={attr} />
+          <ParetoPanel attr={attr} eoThreshold={response.eo_gap_threshold} />
+          <ParetoTradeoffPanel
+            attr={attr}
+            eoThreshold={response.eo_gap_threshold}
+          />
+          {/* Surfaced when no model satisfies the fairness threshold —
+              keeps the UI honest about why nothing was recommended. */}
+          {attr.recommendation_warning && (
+            <div className="rounded-md border border-warning/30 bg-warning/[0.06] px-4 py-3 text-xs text-warning leading-relaxed">
+              <div className="font-mono uppercase tracking-[0.18em] text-2xs mb-1.5">
+                ⚠ No recommendation issued
+              </div>
+              {attr.recommendation_warning}
+            </div>
+          )}
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Plain-English explainer of why this specific model was recommended,
+ *  computed by comparing the recommended model to its closest non-recommended
+ *  alternative. Surfaces the actual tradeoff and the threshold guardrail. */
+function ParetoTradeoffPanel({
+  attr,
+  eoThreshold,
+}: {
+  attr: Stage4Response["results"][number];
+  eoThreshold: number;
+}) {
+  const rec = attr.models.find((m) => m.recommended);
+  if (!rec || rec.auc == null || rec.fairness_gap == null) return null;
+
+  // Highest-AUC model that's NOT recommended — could be a Pareto-optimal model
+  // disqualified by the fairness threshold, or a dominated higher-AUC model.
+  const competitor = attr.models
+    .filter((m) => !m.recommended && m.auc != null && m.fairness_gap != null)
+    .sort((a, b) => (b.auc ?? 0) - (a.auc ?? 0))[0];
+
+  const aucDelta = competitor && competitor.auc != null
+    ? (rec.auc - competitor.auc) * 100
+    : null;
+  const gapDelta = competitor && competitor.fairness_gap != null
+    ? (rec.fairness_gap - competitor.fairness_gap) * 100
+    : null;
+
+  // If the runner-up has higher AUC but is over the fairness threshold, the
+  // tradeoff explanation should highlight that the threshold disqualified it —
+  // this is the single most important narrative the user should see.
+  const competitorOverThreshold =
+    competitor != null
+      && competitor.fairness_gap != null
+      && competitor.fairness_gap > eoThreshold
+      && (competitor.auc ?? 0) > rec.auc;
+
+  return (
+    <div className="rounded-md border border-success/20 bg-success/[0.04] px-4 py-3 text-xs text-ink leading-relaxed">
+      <div className="font-mono uppercase tracking-[0.18em] text-2xs text-success mb-1.5">
+        Why <span className="text-ink">{rec.name}</span> was recommended
+      </div>
+      <div className="text-ink-muted space-y-1.5">
+        <div>
+          {attr.recommended_reason ?? (
+            <>
+              Highest AUC <span className="font-mono text-ink">{rec.auc.toFixed(3)}</span>{" "}
+              on the Pareto frontier with EO gap{" "}
+              <span className="font-mono text-ink">{(rec.fairness_gap * 100).toFixed(1)}pp</span>{" "}
+              (within {(eoThreshold * 100).toFixed(0)}pp threshold).
+            </>
+          )}
+          {rec.composite_score != null && (
+            <span className="ml-1 text-ink-faint">
+              · composite score <span className="font-mono">{rec.composite_score.toFixed(3)}</span>
+            </span>
+          )}
+        </div>
+        {competitorOverThreshold && competitor && competitor.fairness_gap != null && (
+          <div className="text-warning">
+            ⚠ <span className="text-ink">{competitor.name}</span> has higher AUC{" "}
+            <span className="font-mono">{(competitor.auc as number).toFixed(3)}</span>{" "}
+            but its EO gap{" "}
+            <span className="font-mono">{(competitor.fairness_gap * 100).toFixed(1)}pp</span>{" "}
+            exceeds the {(eoThreshold * 100).toFixed(0)}pp fairness threshold —
+            disqualified from being recommended.
+          </div>
+        )}
+        {!competitorOverThreshold && competitor && aucDelta != null && gapDelta != null && (
+          <div>
+            Trades{" "}
+            <span className={cn("font-mono", aucDelta >= 0 ? "text-success" : "text-warning")}>
+              {aucDelta >= 0 ? "+" : ""}
+              {aucDelta.toFixed(1)}pp AUC
+            </span>{" "}
+            for{" "}
+            <span className={cn("font-mono", gapDelta <= 0 ? "text-success" : "text-warning")}>
+              {gapDelta >= 0 ? "+" : ""}
+              {gapDelta.toFixed(1)}pp gap
+            </span>{" "}
+            vs. <span className="text-ink">{competitor.name}</span>.
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1445,7 +2062,8 @@ function ParetoPanel({ attr }: { attr: Stage4Response["results"][number] }) {
             <tr className="text-2xs uppercase tracking-[0.16em] text-ink-dim border-b border-hairline">
               <th className="text-left font-normal py-2.5 pl-4 pr-2">Model</th>
               <th className="text-right font-normal py-2.5 px-2">AUC</th>
-              <th className="text-right font-normal py-2.5 px-2">EO Δ</th>
+              <th className="text-right font-normal py-2.5 px-2" title="Equalized Odds gap">EO Δ</th>
+              <th className="text-right font-normal py-2.5 px-2" title="Predictive Parity gap">PPV Δ</th>
               <th className="text-right font-normal py-2.5 px-2 pr-4">Verdict</th>
             </tr>
           </thead>
@@ -1479,17 +2097,28 @@ function ParetoPanel({ attr }: { attr: Stage4Response["results"][number] }) {
                       ? `${(m.fairness_gap * 100).toFixed(1)}pp`
                       : "—"}
                   </td>
+                  <td className="py-2.5 px-2 text-right font-mono text-xs">
+                    {m.ppv_gap != null
+                      ? `${(m.ppv_gap * 100).toFixed(1)}pp`
+                      : "—"}
+                  </td>
                   <td className="py-2.5 px-2 pr-4 text-right">
                     {m.recommended ? (
-                      <Badge tone="accent" dot>
-                        Recommended
-                      </Badge>
+                      <span title="Best accuracy among models that aren't strictly worse than any other in either accuracy or fairness — the system's pick.">
+                        <Badge tone="success" dot>
+                          Recommended
+                        </Badge>
+                      </span>
                     ) : m.pareto_optimal ? (
-                      <Badge tone="success">Pareto</Badge>
+                      <span title="Pareto-optimal: no other model is at least as accurate AND at least as fair. A viable alternative if you want a different accuracy/fairness tradeoff than the recommended pick.">
+                        <Badge tone="warning">Pareto</Badge>
+                      </span>
                     ) : (
-                      <Badge tone="neutral" className="opacity-60">
-                        Dominated
-                      </Badge>
+                      <span title="Dominated: at least one other model is both more accurate AND fairer. There's no reason to pick this one.">
+                        <Badge tone="danger" className="opacity-70">
+                          Dominated
+                        </Badge>
+                      </span>
                     )}
                   </td>
                 </tr>
@@ -1627,26 +2256,33 @@ function ParetoSvg({
         />
       )}
 
-      {/* points */}
+      {/* points — outer halo color matches the verdict (green/yellow/red) so
+          the chart visually matches the table; inner fill stays the model color */}
       {models.map((m) => {
         const color = MODEL_COLOR[m.color] ?? MODEL_COLOR.m1;
         const cx = xScale(m.auc);
         const cy = yScale(m.fairness_gap);
         const isRec = m.recommended;
         const isPareto = m.pareto_optimal;
+        // Verdict ring color (CSS-named so it picks up theme tokens).
+        const ringColor = isRec
+          ? "#34D399"   // success / green
+          : isPareto
+          ? "#FBBF24"   // warning / yellow
+          : "#F87171";  // danger / red
         return (
           <g key={m.key}>
             {isRec && (
-              <circle cx={cx} cy={cy} r={14} fill={color} opacity={0.18} />
+              <circle cx={cx} cy={cy} r={14} fill={ringColor} opacity={0.22} />
             )}
             <circle
               cx={cx}
               cy={cy}
               r={isRec ? 6 : isPareto ? 5 : 4}
-              fill={isRec ? color : isPareto ? color : "transparent"}
-              stroke={color}
-              strokeWidth={1.5}
-              opacity={isPareto || isRec ? 1 : 0.55}
+              fill={isRec || isPareto ? color : "transparent"}
+              stroke={ringColor}
+              strokeWidth={2}
+              opacity={isPareto || isRec ? 1 : 0.65}
             />
             <text
               x={cx + 9}
@@ -1660,6 +2296,15 @@ function ParetoSvg({
           </g>
         );
       })}
+      {/* Verdict legend */}
+      <g transform={`translate(${PAD.left + 6} ${PAD.top + 6})`}>
+        <circle cx={0} cy={4} r={4} fill="transparent" stroke="#34D399" strokeWidth={2} />
+        <text x={9} y={7} fontSize={9} className="fill-ink-dim font-mono">Recommended</text>
+        <circle cx={92} cy={4} r={4} fill="transparent" stroke="#FBBF24" strokeWidth={2} />
+        <text x={101} y={7} fontSize={9} className="fill-ink-dim font-mono">Pareto</text>
+        <circle cx={148} cy={4} r={4} fill="transparent" stroke="#F87171" strokeWidth={2} />
+        <text x={157} y={7} fontSize={9} className="fill-ink-dim font-mono">Dominated</text>
+      </g>
     </svg>
   );
 }
@@ -1689,128 +2334,770 @@ function niceStep(rough: number): number {
 
 /* Stage 5 — Root cause */
 
-function RootCauseArtifact({ cfg }: { cfg: AuditConfig }) {
-  return (
-    <div className="grid lg:grid-cols-2 gap-5">
-      <Card className="p-5">
-        <div className="flex items-center justify-between mb-3">
-          <span className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
-            Bayesian posterior
-          </span>
-          <span className="text-2xs text-ink-dim font-mono uppercase tracking-wider">
-            5 classes
-          </span>
-        </div>
-        <div className="font-serif text-xl text-ink mb-1">
-          Proxy discrimination
-        </div>
-        <div className="text-xs text-ink-muted mb-5">
-          A feature in your data correlates with{" "}
-          <span className="font-mono text-ink">{cfg.protectedAttrs[0]}</span>{" "}
-          and drives prediction differently across groups.
-        </div>
-        <div className="space-y-2.5">
-          {ROOT_CAUSE.map((c) => (
-            <div key={c.label}>
-              <div className="flex items-center justify-between text-xs mb-1">
-                <span className="text-ink-muted">{c.label}</span>
-                <span className="font-mono tabular text-ink-dim">
-                  {(c.value * 100).toFixed(0)}%
-                </span>
-              </div>
-              <div className="h-1 rounded-full bg-elevated overflow-hidden">
-                <div
-                  className={
-                    c.color === "danger"
-                      ? "h-full bg-danger"
-                      : c.color === "warning"
-                      ? "h-full bg-warning"
-                      : "h-full bg-ink-faint"
-                  }
-                  style={{ width: `${c.value * 100}%` }}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-      </Card>
+const CAUSE_LABELS: Record<string, string> = {
+  proxy_discrimination: "Proxy discrimination",
+  representation_bias: "Representation bias",
+  label_bias: "Label bias",
+  threshold_effect: "Threshold effect",
+  model_complexity_bias: "Model complexity bias",
+};
 
-      <Card className="p-5">
-        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-3">
-          SHAP rank delta · top features
+/** Technical, single-sentence definition — kept for the existing slot. */
+const CAUSE_DESC: Record<string, string> = {
+  proxy_discrimination: "A feature correlated with the protected attribute drives predictions differently across groups.",
+  representation_bias: "Group underrepresentation skews learned boundaries and evaluation metrics.",
+  label_bias: "Historical decisions embedded in labels propagate bias into predictions.",
+  threshold_effect: "Decision-boundary placement produces disparate outcomes even from fair scores.",
+  model_complexity_bias: "Model over-fits group-specific noise patterns not present at deployment.",
+};
+
+/** Plain-English version — speaks to non-ML readers without jargon. */
+const CAUSE_PLAIN: Record<string, string> = {
+  proxy_discrimination:
+    "Even though the protected attribute itself wasn't shown to the model, another feature is quietly acting as a stand-in for it. The model is taking a back door.",
+  representation_bias:
+    "One group has too few examples in the training data, so the model learned mostly from the other group and doesn't make fair predictions for the smaller one.",
+  label_bias:
+    "The 'right answers' the model learned from already reflect bias in past human decisions. Fixing the model alone can't undo biased history.",
+  threshold_effect:
+    "The model's raw scores are roughly fair across groups, but the cutoff line that decides 'yes/no' falls in a place that affects groups unequally.",
+  model_complexity_bias:
+    "The model is too elaborate and is picking up on group-specific quirks in the training data that won't hold up in the real world.",
+};
+
+/** One-line plain-English version of each Stage-5 metric for inline help text. */
+const METRIC_HELP = {
+  flipRate:
+    "If we made a person look like they belong to the other group (by changing the most group-correlated features), how often does the model's decision flip? Higher = the model is leaning hard on group-related features.",
+  permTest:
+    "Did the difference between groups happen by chance, or is the pattern real? p < 0.05 means the pattern is unlikely to be random.",
+  baseRateGap:
+    "How different the actual positive rates are between the two groups in the data itself — before any model gets involved.",
+} as const;
+
+/** Build a forensic, dataset-specific plain-English explanation for the
+ *  diagnosed root cause. Names the actual minority/majority groups (with
+ *  their human labels and sample counts) and ties to model behavior. */
+function buildForensicSummary(
+  cause: string,
+  attrName: string,
+  groupSizes: Record<string, number>,
+  groupPosRates: Record<string, number | null>,
+  modelName: string,
+  flipRate: number | null,
+  baseRateGap: number | null,
+  topProxyFeature: string | null
+): string {
+  const sized = Object.entries(groupSizes).sort((a, b) => a[1] - b[1]);
+  if (sized.length < 2) return "";
+  const [minRaw, minN] = sized[0];
+  const [majRaw, majN] = sized[sized.length - 1];
+  const minFmt = formatGroup(attrName, minRaw);
+  const majFmt = formatGroup(attrName, majRaw);
+  const minName = minFmt.display ?? minRaw;
+  const majName = majFmt.display ?? majRaw;
+  const ratio = majN / Math.max(minN, 1);
+  const attrPlain = attrLabel(attrName);
+
+  const minPos = groupPosRates[minRaw];
+  const majPos = groupPosRates[majRaw];
+  const posSummary =
+    minPos != null && majPos != null
+      ? ` Positive rate: ${(minPos * 100).toFixed(0)}% for ${minName} vs. ${(majPos * 100).toFixed(0)}% for ${majName}.`
+      : "";
+
+  switch (cause) {
+    case "representation_bias":
+      return (
+        `${minName} (${attrName} = ${minRaw}, n = ${minN}) is underrepresented compared to ` +
+        `${majName} (${attrName} = ${majRaw}, n = ${majN}) — ${ratio.toFixed(1)}× more samples ` +
+        `in the majority group. ${modelName} learned its decision boundaries primarily ` +
+        `from the larger group, so it doesn't generalize fairly to ${minName}.`
+      );
+    case "proxy_discrimination":
+      return (
+        `${modelName} is using${topProxyFeature ? ` the feature "${topProxyFeature}"` : " a feature"} ` +
+        `as a backdoor signal for ${attrPlain}. Even though ${attrName} itself wasn't a model input, ` +
+        `swapping a person's most correlated features changes the prediction ` +
+        `${flipRate != null ? `${(flipRate * 100).toFixed(0)}% of the time` : "noticeably often"} — ` +
+        `evidence the model is treating ${minName} (${attrName} = ${minRaw}) and ${majName} ` +
+        `(${attrName} = ${majRaw}) differently through that proxy.`
+      );
+    case "label_bias":
+      return (
+        `The training labels themselves differ across groups: positive rate is ${(minPos != null ? minPos * 100 : 0).toFixed(0)}% for ` +
+        `${minName} (n = ${minN}) vs. ${(majPos != null ? majPos * 100 : 0).toFixed(0)}% for ${majName} (n = ${majN}). ` +
+        `Because flipping group-correlated features barely changes predictions, the bias lives in the ` +
+        `ground truth, not the features — ${modelName} is faithfully reproducing the historical decisions it was given.`
+      );
+    case "threshold_effect":
+      return (
+        `${modelName}'s raw scores look comparable across groups, but the 0.5 cutoff lands in a different ` +
+        `place for each one — producing different selection rates for ${minName} (${attrName} = ${minRaw}) ` +
+        `vs. ${majName} (${attrName} = ${majRaw}).${posSummary} The fix is per-group threshold optimization, ` +
+        `not retraining.`
+      );
+    case "model_complexity_bias":
+      return (
+        `${modelName} is overfitting group-specific quirks. ${minName} (n = ${minN}) and ${majName} ` +
+        `(n = ${majN}) have noisy patterns the model has memorized rather than generalized — a simpler ` +
+        `or more regularized model would treat them more consistently.`
+      );
+    default:
+      return "";
+  }
+}
+
+function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: AuditConfig }) {
+  const firstAttr = response.results ? Object.values(response.results)[0] : null;
+  const attrName  = response.results ? Object.keys(response.results)[0] : cfg.protectedAttrs[0];
+
+  if (!firstAttr) {
+    return (
+      <div className="rounded-md border border-hairline bg-elevated/40 p-6 text-center text-sm text-ink-muted">
+        No protected attributes with ≥2 groups found.
+      </div>
+    );
+  }
+
+  const posterior = firstAttr.bayesian_root_cause;
+  const primaryCause = response.primary_root_cause ?? "";
+  const sorted = Object.entries(posterior).sort(([, a], [, b]) => (b ?? 0) - (a ?? 0));
+  const primaryConfidence = posterior[primaryCause] ?? 0;
+
+  // Forensic specifics — grounded in the actual dataset (group names, counts).
+  const forensic = buildForensicSummary(
+    primaryCause,
+    attrName,
+    firstAttr.group_sizes ?? {},
+    firstAttr.group_positive_rates ?? {},
+    response.model_name,
+    firstAttr.counterfactual_flip_rate,
+    firstAttr.base_rate_gap,
+    firstAttr.proxy_features[0]?.feature ?? null
+  );
+
+  return (
+    <div className="space-y-5">
+      {/* Plain-English summary — forensic, grounded in this dataset's groups */}
+      <div className="rounded-md border border-accent/20 bg-accent-soft/30 px-5 py-4">
+        <div className="flex items-baseline gap-2 mb-1.5">
+          <span className="text-2xs font-mono uppercase tracking-[0.18em] text-accent">
+            In plain English
+          </span>
+          <span className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+            why is the model unfair?
+          </span>
         </div>
-        <div className="space-y-3">
-          {[
-            { name: "priors_count", a: 1, b: 4, delta: "+3" },
-            { name: "age", a: 2, b: 2, delta: "0" },
-            { name: "charge_degree", a: 5, b: 3, delta: "−2" },
-            { name: "decile_score", a: 3, b: 5, delta: "+2" },
-          ].map((r) => (
-            <div
-              key={r.name}
-              className="grid grid-cols-[1fr_auto_auto] gap-3 items-center"
-            >
-              <div className="font-mono text-xs text-ink truncate">{r.name}</div>
-              <div className="font-mono text-2xs text-ink-dim tabular">
-                #{r.a} → #{r.b}
+        <p className="text-sm text-ink leading-relaxed mb-2">
+          The leading explanation is{" "}
+          <span className="text-ink font-medium">
+            {(CAUSE_LABELS[primaryCause] ?? primaryCause).toLowerCase()}
+          </span>{" "}
+          — about{" "}
+          <span className="font-mono">
+            {(primaryConfidence * 100).toFixed(0)}%
+          </span>{" "}
+          confident.
+        </p>
+        {forensic && (
+          <p className="text-sm text-ink-muted leading-relaxed">{forensic}</p>
+        )}
+      </div>
+
+      {/* Group sample-count table — surface the actual numbers driving the diagnosis */}
+      <GroupContextPanel
+        attrName={attrName}
+        sizes={firstAttr.group_sizes ?? {}}
+        posRates={firstAttr.group_positive_rates ?? {}}
+      />
+
+      {/* Header row: verdict + stats */}
+      <div className="grid lg:grid-cols-3 gap-5">
+        {/* Bayesian posterior */}
+        <Card className="lg:col-span-2 p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+                Bayesian posterior · 5 classes
               </div>
-              <div
-                className={cn(
-                  "font-mono text-xs tabular px-1.5 py-0.5 rounded",
-                  r.delta.startsWith("+") &&
-                    "text-danger bg-danger/10",
-                  r.delta === "0" && "text-ink-dim",
-                  r.delta.startsWith("−") && "text-success bg-success/10"
-                )}
-              >
-                {r.delta}
+              <div className="text-2xs text-ink-faint mt-0.5">
+                How likely each cause is, totalling 100%
               </div>
             </div>
-          ))}
-        </div>
-        <div className="mt-5 pt-4 border-t border-hairline text-xs text-ink-muted leading-relaxed">
-          <span className="font-mono text-ink">priors_count</span> jumps from
-          rank #4 (Logistic) to rank #1 (XGBoost) for African-American
-          defendants. Permutation test{" "}
-          <span className="font-mono text-ink">p = 0.003</span>.
-        </div>
-      </Card>
+            <div className="flex items-center gap-2">
+              {!response.shap_available && (
+                <span title="Computed from feature–group correlations only (the SHAP library wasn't available)">
+                  <Badge tone="neutral">correlation-based</Badge>
+                </span>
+              )}
+              {response.shap_available && (
+                <span title="Validated using SHAP — measures how much each feature contributes to each prediction">
+                  <Badge tone="success" dot>SHAP validated</Badge>
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="font-serif text-xl text-ink mb-1">
+            {CAUSE_LABELS[primaryCause] ?? primaryCause}
+          </div>
+          <div className="text-xs text-ink-muted mb-1 max-w-lg">
+            {CAUSE_DESC[primaryCause] ?? ""}
+          </div>
+          <div className="text-xs text-ink-faint mb-5 max-w-lg">
+            Protected attribute:{" "}
+            <span className="font-mono text-ink">{attrName}</span>
+            {" · "}model:{" "}
+            <span className="font-mono text-ink">{response.model_name}</span>
+          </div>
+          <div className="space-y-3">
+            {sorted.map(([key, val]) => {
+              const pct = (val ?? 0) * 100;
+              const isPrimary = key === primaryCause;
+              return (
+                <div key={key} title={CAUSE_PLAIN[key] ?? ""}>
+                  <div className="flex items-center justify-between text-xs mb-1">
+                    <span className={cn("text-ink-muted", isPrimary && "text-ink font-medium")}>
+                      {CAUSE_LABELS[key] ?? key}
+                    </span>
+                    <span className="font-mono tabular text-ink-dim">
+                      {pct.toFixed(0)}%
+                    </span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-elevated overflow-hidden">
+                    <div
+                      className={cn(
+                        "h-full transition-all duration-500",
+                        isPrimary ? "bg-danger" : pct > 20 ? "bg-warning" : "bg-ink-faint"
+                      )}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  {/* Plain-English subtitle so each bar reads on its own */}
+                  <div className="text-2xs text-ink-faint mt-1 leading-snug max-w-md">
+                    {CAUSE_PLAIN[key] ?? ""}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+
+        {/* Statistical validation — each metric annotated for non-ML readers */}
+        <Card className="p-5 space-y-5">
+          <div title={METRIC_HELP.flipRate}>
+            <div className="flex items-baseline justify-between mb-2">
+              <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+                Counterfactual flip rate
+              </div>
+              <div className="text-2xs text-ink-faint">would change?</div>
+            </div>
+            <div className={cn(
+              "font-mono tabular text-2xl",
+              (firstAttr.counterfactual_flip_rate ?? 0) > 0.2 ? "text-danger" :
+              (firstAttr.counterfactual_flip_rate ?? 0) > 0.1 ? "text-warning" : "text-success"
+            )}>
+              {firstAttr.counterfactual_flip_rate != null
+                ? `${(firstAttr.counterfactual_flip_rate * 100).toFixed(1)}%`
+                : "—"}
+            </div>
+            <div className="text-xs text-ink-muted mt-1 leading-snug">
+              In plain English: if a person's most group-correlated features were
+              swapped to look like the other group's, this is how often the model
+              would change its decision.
+            </div>
+          </div>
+          <div title={METRIC_HELP.permTest}>
+            <div className="flex items-baseline justify-between mb-2">
+              <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+                Permutation test
+              </div>
+              <div className="text-2xs text-ink-faint">real or random?</div>
+            </div>
+            <div className={cn(
+              "font-mono tabular text-2xl",
+              firstAttr.permutation_test.significant ? "text-warning" : "text-success"
+            )}>
+              {firstAttr.permutation_test.p_value != null
+                ? `p = ${firstAttr.permutation_test.p_value < 0.001 ? "<0.001" : firstAttr.permutation_test.p_value.toFixed(3)}`
+                : "—"}
+            </div>
+            <div className="text-xs text-ink-muted mt-1 leading-snug">
+              {firstAttr.permutation_test.significant
+                ? "The pattern is statistically real, not random noise."
+                : "The pattern could plausibly be random noise."}
+              {" "}Based on{" "}
+              <span className="font-mono">{firstAttr.permutation_test.n_permutations}</span>{" "}
+              shuffled re-tests.
+            </div>
+          </div>
+          <div title={METRIC_HELP.baseRateGap}>
+            <div className="flex items-baseline justify-between mb-2">
+              <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+                Base-rate gap between groups
+              </div>
+              <div className="text-2xs text-ink-faint">in the data</div>
+            </div>
+            <div className="font-mono tabular text-2xl text-ink">
+              {firstAttr.base_rate_gap != null
+                ? `${(firstAttr.base_rate_gap * 100).toFixed(1)}pp`
+                : "—"}
+            </div>
+            <div className="text-xs text-ink-muted mt-1 leading-snug">
+              {firstAttr.groups.join(" vs ")} — measured in the data itself,
+              before any model is trained.
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      {/* SHAP rank delta / correlated features */}
+      {response.shap_available && firstAttr.proxy_features.length > 0 ? (
+        <>
+          <div className="rounded-md border border-hairline bg-elevated/30 px-4 py-3 text-xs text-ink-muted leading-relaxed">
+            <span className="text-ink font-medium">What the next table shows: </span>
+            features the model relies on much more for one group than the other.
+            A big imbalance is a fingerprint of <em className="text-ink not-italic">proxy
+            discrimination</em> — the feature is acting as a stand-in for the
+            protected attribute. Ratio = how many times more important the feature
+            is for one group vs. the other.
+          </div>
+          <ProxyFeaturesPanel
+            proxyFeatures={firstAttr.proxy_features}
+            groupShap={firstAttr.group_shap}
+            groups={firstAttr.groups}
+          />
+        </>
+      ) : firstAttr.correlated_features.length > 0 ? (
+        <>
+          <div className="rounded-md border border-hairline bg-elevated/30 px-4 py-3 text-xs text-ink-muted leading-relaxed">
+            <span className="text-ink font-medium">What the next table shows: </span>
+            features whose typical values differ most between the two groups in
+            the data itself. SMD (standardized mean difference) of 0.5+ is large.
+            Big gaps here mean the feature carries information about the
+            protected group — even though that group label was excluded from training.
+          </div>
+          <CorrFeaturesPanel corrFeatures={firstAttr.correlated_features} />
+        </>
+      ) : null}
     </div>
   );
 }
 
-/* Stage 6 — Remediation */
-
-function RemediationArtifact() {
+/** Group-context panel for Stage 5 — names each group with its human label,
+ *  raw value, sample count, and positive rate. Anchors the forensic summary
+ *  to concrete numbers a non-ML reader can verify. */
+function GroupContextPanel({
+  attrName,
+  sizes,
+  posRates,
+}: {
+  attrName: string;
+  sizes: Record<string, number>;
+  posRates: Record<string, number | null>;
+}) {
+  const entries = Object.entries(sizes).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) return null;
+  const total = entries.reduce((s, [, n]) => s + n, 0) || 1;
+  const anyUnknown = entries.some(([raw]) => !formatGroup(attrName, raw).known);
   return (
-    <div className="grid lg:grid-cols-3 gap-4">
-      {REMEDIATION.map((r) => (
-        <Card key={r.title} className="p-5">
+    <div className="rounded-md border border-hairline overflow-hidden">
+      <div className="px-4 py-2.5 bg-elevated/30 border-b border-hairline flex items-baseline justify-between">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+          Groups in {attrLabel(attrName)} ({attrName})
+        </div>
+        <div className="text-2xs font-mono text-ink-faint">
+          encoded value · meaning · sample count
+        </div>
+      </div>
+      <table className="w-full text-sm tabular">
+        <thead>
+          <tr className="text-2xs uppercase tracking-[0.16em] text-ink-dim border-b border-hairline">
+            <th className="text-left font-normal py-2 pl-4 pr-3">Encoded</th>
+            <th className="text-left font-normal py-2 px-3">Meaning</th>
+            <th className="text-right font-normal py-2 px-3">n</th>
+            <th className="text-right font-normal py-2 px-3">Share</th>
+            <th className="text-right font-normal py-2 px-3 pr-4">P(+)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map(([raw, n], i) => {
+            const fmt = formatGroup(attrName, raw);
+            const share = (n / total) * 100;
+            const isMinority = i === entries.length - 1 && entries.length >= 2;
+            const isMajority = i === 0 && entries.length >= 2;
+            const pos = posRates[raw];
+            return (
+              <tr key={raw} className="border-b border-hairline last:border-0">
+                <td className="py-2 pl-4 pr-3 font-mono text-xs">
+                  {attrName} = {raw}
+                </td>
+                <td className="py-2 px-3 text-xs">
+                  <span className="text-ink">{fmt.display ?? raw}</span>
+                  {!fmt.known && (
+                    <span className="ml-1.5 text-ink-faint text-2xs" title={UNKNOWN_MAPPING_HINT}>
+                      ⓘ
+                    </span>
+                  )}
+                </td>
+                <td className="py-2 px-3 text-right font-mono text-xs">
+                  {n.toLocaleString()}
+                  {isMinority && (
+                    <span className="ml-1.5 text-warning text-2xs uppercase tracking-wider">minority</span>
+                  )}
+                  {isMajority && (
+                    <span className="ml-1.5 text-ink-faint text-2xs uppercase tracking-wider">majority</span>
+                  )}
+                </td>
+                <td className="py-2 px-3 text-right font-mono text-xs text-ink-dim">
+                  {share.toFixed(1)}%
+                </td>
+                <td className="py-2 px-3 pr-4 text-right font-mono text-xs">
+                  {pos != null ? `${(pos * 100).toFixed(0)}%` : "—"}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {anyUnknown && (
+        <div className="px-4 py-2 bg-elevated/20 text-2xs text-ink-faint border-t border-hairline">
+          Some encoded values don't have a known meaning in our label dictionary —
+          add metadata for full interpretability.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProxyFeaturesPanel({
+  proxyFeatures,
+  groupShap,
+  groups,
+}: {
+  proxyFeatures: Stage5ProxyFeature[];
+  groupShap: Record<string, { importance: Record<string, number | null>; ranks: Record<string, number> }>;
+  groups: string[];
+}) {
+  const ga = groups[0];
+  const gb = groups[1];
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+          Proxy discrimination · SHAP importance ratio ≥ 2×
+        </div>
+        <div className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+          mean |SHAP| per group
+        </div>
+      </div>
+      <div className="overflow-x-auto rounded-md border border-hairline">
+        <table className="w-full text-sm tabular">
+          <thead>
+            <tr className="text-2xs uppercase tracking-[0.16em] text-ink-dim border-b border-hairline">
+              <th className="text-left font-normal py-2.5 pl-4 pr-3">Feature</th>
+              <th className="text-right font-normal py-2.5 px-3">
+                Imp · {ga}
+              </th>
+              <th className="text-right font-normal py-2.5 px-3">
+                Rank · {ga}
+              </th>
+              {gb && <th className="text-right font-normal py-2.5 px-3">Imp · {gb}</th>}
+              {gb && <th className="text-right font-normal py-2.5 px-3">Rank · {gb}</th>}
+              <th className="text-right font-normal py-2.5 px-3 pr-4">Ratio</th>
+            </tr>
+          </thead>
+          <tbody>
+            {proxyFeatures.map((f) => {
+              const impA = f.importances[ga];
+              const impB = gb ? f.importances[gb] : null;
+              const rkA = groupShap[ga]?.ranks[f.feature];
+              const rkB = gb ? groupShap[gb]?.ranks[f.feature] : null;
+              return (
+                <tr key={f.feature} className="border-b border-hairline last:border-0">
+                  <td className="py-2.5 pl-4 pr-3 font-mono text-xs text-ink">{f.feature}</td>
+                  <td className="py-2.5 px-3 text-right font-mono text-xs">
+                    {impA != null ? impA.toFixed(4) : "—"}
+                  </td>
+                  <td className="py-2.5 px-3 text-right font-mono text-xs text-ink-dim">
+                    {rkA != null ? `#${rkA}` : "—"}
+                  </td>
+                  {gb && (
+                    <td className="py-2.5 px-3 text-right font-mono text-xs">
+                      {impB != null ? impB.toFixed(4) : "—"}
+                    </td>
+                  )}
+                  {gb && (
+                    <td className="py-2.5 px-3 text-right font-mono text-xs text-ink-dim">
+                      {rkB != null ? `#${rkB}` : "—"}
+                    </td>
+                  )}
+                  <td className="py-2.5 px-3 pr-4 text-right font-mono text-xs">
+                    <span className={cn(
+                      (f.ratio ?? 0) >= 3 ? "text-danger" : "text-warning"
+                    )}>
+                      {f.ratio != null ? `${f.ratio.toFixed(1)}×` : "—"}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function CorrFeaturesPanel({ corrFeatures }: { corrFeatures: Stage5CorrFeature[] }) {
+  if (corrFeatures.length === 0) return null;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+          Top features correlated with protected attribute
+        </div>
+        <div className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+          standardized mean difference
+        </div>
+      </div>
+      <div className="overflow-x-auto rounded-md border border-hairline">
+        <table className="w-full text-sm tabular">
+          <thead>
+            <tr className="text-2xs uppercase tracking-[0.16em] text-ink-dim border-b border-hairline">
+              <th className="text-left font-normal py-2.5 pl-4 pr-3">Feature</th>
+              <th className="text-right font-normal py-2.5 px-3">Mean · {corrFeatures[0]?.group_a}</th>
+              <th className="text-right font-normal py-2.5 px-3">Mean · {corrFeatures[0]?.group_b}</th>
+              <th className="text-right font-normal py-2.5 px-3 pr-4">SMD</th>
+            </tr>
+          </thead>
+          <tbody>
+            {corrFeatures.map((f) => (
+              <tr key={f.feature} className="border-b border-hairline last:border-0">
+                <td className="py-2.5 pl-4 pr-3 font-mono text-xs text-ink">{f.feature}</td>
+                <td className="py-2.5 px-3 text-right font-mono text-xs">
+                  {f.mean_a != null ? f.mean_a.toFixed(3) : "—"}
+                </td>
+                <td className="py-2.5 px-3 text-right font-mono text-xs">
+                  {f.mean_b != null ? f.mean_b.toFixed(3) : "—"}
+                </td>
+                <td className="py-2.5 px-3 pr-4 text-right font-mono text-xs">
+                  <span className={cn(
+                    (f.smd ?? 0) >= 0.5 ? "text-danger" :
+                    (f.smd ?? 0) >= 0.2 ? "text-warning" : "text-ink"
+                  )}>
+                    {f.smd != null ? f.smd.toFixed(3) : "—"}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/* Stage 6 — Guided remediation (real data from Flask /api/audit/stage/6) */
+
+const CAUSE_LABEL_SHORT: Record<string, string> = {
+  proxy_discrimination: "Proxy discrimination",
+  representation_bias: "Representation bias",
+  label_bias: "Label bias",
+  threshold_effect: "Threshold effect",
+  model_complexity_bias: "Model complexity bias",
+};
+
+/** Plain-English meaning of each action status, shown as a subtitle on every card. */
+const STATUS_HELP: Record<Stage6ActionStatus, string> = {
+  recommended: "Targets the actual root cause — apply this one",
+  optional: "May help on the side, but isn't the main lever",
+  blocked: "Would hide the problem rather than fix it",
+};
+
+const STATUS_LABEL: Record<Stage6ActionStatus, string> = {
+  recommended: "Recommended",
+  optional: "Optional",
+  blocked: "Blocked",
+};
+
+function RemediationArtifact({ response }: { response: Stage6Response }) {
+  const rec = response.actions.filter((a) => a.status === "recommended");
+  const opt = response.actions.filter((a) => a.status === "optional");
+  const blocked = response.actions.filter((a) => a.status === "blocked");
+
+  return (
+    <div className="space-y-5">
+      {/* Plain-English summary — orients non-ML readers before the technical detail */}
+      <div className="rounded-md border border-accent/20 bg-accent-soft/30 px-5 py-4">
+        <div className="flex items-baseline gap-2 mb-1.5">
+          <span className="text-2xs font-mono uppercase tracking-[0.18em] text-accent">
+            In plain English
+          </span>
+          <span className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+            what should we do about it?
+          </span>
+        </div>
+        <p className="text-sm text-ink leading-relaxed">
+          Now that the audit knows <em className="not-italic text-ink">why</em>{" "}
+          the model is biased, it suggests only the fixes that{" "}
+          <span className="font-medium">
+            actually address that specific cause
+          </span>
+          {" "}— and explicitly blocks the ones that would{" "}
+          <span className="font-medium">just hide the problem</span> or create
+          new legal/ethical risk.
+          {response.safe_to_auto_fix ? (
+            <span className="text-success">
+              {" "}The recommended fix here is safe to apply automatically.
+            </span>
+          ) : (
+            <span className="text-warning">
+              {" "}A human should sign off before any of these are deployed.
+            </span>
+          )}
+        </p>
+      </div>
+
+      {/* Summary header */}
+      <div className="grid lg:grid-cols-3 gap-5">
+        <Card className="lg:col-span-2 p-5">
           <div className="flex items-center justify-between mb-3">
-            {r.status === "blocked" && (
-              <Badge tone="danger" dot>
-                Blocked
-              </Badge>
-            )}
-            {r.status === "recommended" && (
-              <Badge tone="accent" dot>
-                Apply
-              </Badge>
-            )}
-            {r.status === "optional" && (
-              <Badge tone="neutral" dot>
-                Optional
-              </Badge>
-            )}
-            <span className="text-2xs text-ink-dim font-mono uppercase tracking-wider">
-              Stage 6
+            <span className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+              Diagnosis · {CAUSE_LABEL_SHORT[response.primary_root_cause] ?? response.primary_root_cause}
+            </span>
+            <div className="flex items-center gap-2">
+              {response.safe_to_auto_fix ? (
+                <span title="Confidence in the diagnosis is high enough that the recommended fix can run without human sign-off">
+                  <Badge tone="success" dot>Safe to apply</Badge>
+                </span>
+              ) : (
+                <span title="The cause type or confidence level means a person should review before applying any fix">
+                  <Badge tone="warning">Manual review required</Badge>
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="font-serif text-xl text-ink mb-2">{response.diagnosis}</div>
+          <p className="text-sm text-ink-muted leading-relaxed max-w-2xl">{response.summary}</p>
+          <div className="mt-4 flex flex-wrap gap-x-5 gap-y-1 text-2xs font-mono text-ink-dim uppercase tracking-wider">
+            <span>model: <span className="text-ink">{response.model_name}</span></span>
+            <span>
+              <span className="text-success">{rec.length} recommended</span>
+              {" · "}
+              <span className="text-ink-muted">{opt.length} optional</span>
+              {" · "}
+              <span className={cn(blocked.length > 0 ? "text-danger" : "text-ink-muted")}>
+                {blocked.length} blocked
+              </span>
             </span>
           </div>
-          <div className="font-serif text-lg text-ink mb-2">{r.title}</div>
-          <p className="text-sm text-ink-muted leading-relaxed">{r.body}</p>
         </Card>
-      ))}
+
+        {/* Safety panel */}
+        <Card className="p-5 space-y-4">
+          <div>
+            <div className="flex items-baseline justify-between mb-2">
+              <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+                Automated fix
+              </div>
+              <div className="text-2xs text-ink-faint">human needed?</div>
+            </div>
+            <div className={cn(
+              "font-mono tabular text-2xl",
+              response.safe_to_auto_fix ? "text-success" : "text-warning"
+            )}>
+              {response.safe_to_auto_fix ? "Approved" : "Blocked"}
+            </div>
+            <div className="text-xs text-ink-muted mt-1 leading-snug">
+              {response.safe_to_auto_fix
+                ? "The audit is confident enough (≥ 70%) that the recommended fix can be applied and verified automatically."
+                : "Either the cause requires human judgment, or the audit isn't confident enough to apply a fix without oversight."}
+            </div>
+          </div>
+          <div>
+            <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-2">
+              Root cause class
+            </div>
+            <div className="font-mono text-sm text-ink">
+              {response.primary_root_cause.replace(/_/g, " ")}
+            </div>
+            <div className="text-xs text-ink-faint mt-1">
+              Carried over from Stage 5's diagnosis
+            </div>
+          </div>
+          {response.warning && (
+            <div className="rounded-md border border-warning/30 bg-warning/[0.06] px-3 py-2.5 text-xs text-warning leading-relaxed">
+              <div className="font-medium uppercase tracking-wider text-2xs mb-1">
+                Heads-up
+              </div>
+              {response.warning}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* Action cards — sorted recommended → optional → blocked, with plain-language status */}
+      <div className="grid lg:grid-cols-3 gap-4">
+        {[...rec, ...opt, ...blocked].map((action) => (
+          <RemediationCard key={action.id} action={action} />
+        ))}
+      </div>
     </div>
+  );
+}
+
+function RemediationCard({ action }: { action: Stage6Action }) {
+  // Recommended → green (success), Optional → yellow (warning),
+  // Blocked → red (danger). Mirrors Stage 4's verdict colors so the visual
+  // language stays consistent across stages.
+  const tone =
+    action.status === "blocked"
+      ? "danger"
+      : action.status === "recommended"
+      ? "success"
+      : "warning";
+  const hasCriteria = action.success_criteria && action.success_criteria.length > 0;
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between mb-3">
+        <span title={STATUS_HELP[action.status]}>
+          <Badge tone={tone} dot>{STATUS_LABEL[action.status]}</Badge>
+        </span>
+        <span className="text-2xs text-ink-dim font-mono uppercase tracking-wider">
+          Stage 6
+        </span>
+      </div>
+      {/* Plain-English meaning of the badge so non-ML readers know what it implies */}
+      <div className="text-2xs text-ink-faint uppercase tracking-wider mb-2">
+        {STATUS_HELP[action.status]}
+      </div>
+      <div className="font-serif text-base text-ink mb-2">{action.title}</div>
+      <p className="text-sm text-ink-muted leading-relaxed">{action.body}</p>
+      {hasCriteria && (
+        <div className="mt-3 pt-3 border-t border-hairline">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-1.5">
+            Accept this fix only if
+          </div>
+          <ul className="space-y-1">
+            {action.success_criteria.map((c, i) => (
+              <li
+                key={i}
+                className="flex items-start gap-2 text-xs text-ink-muted leading-snug"
+              >
+                <span className="text-success font-mono mt-0.5">✓</span>
+                <span>{c}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {action.status === "blocked" && !hasCriteria && (
+        <div className="mt-3 pt-3 border-t border-hairline text-2xs text-ink-faint uppercase tracking-wider">
+          No fix is being recommended — there are no acceptance criteria.
+        </div>
+      )}
+    </Card>
   );
 }
 
