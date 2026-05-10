@@ -3718,11 +3718,15 @@ def _stage8_deployment(stage7: dict) -> dict:
     if all_passed and passed_count == 4:
         verdict = "deploy"
         verdict_text = "Deploy — all four reasoning checkpoints passed."
-    elif passed_count >= 2 and cp4.get("fairness_compliant"):
+    elif passed_count >= 3 and cp4.get("fairness_compliant"):
+        # 3/4 with CP4 holding = one soft signal failed (Pareto, diagnosis
+        # agreement, or fingerprint severity). Conditional is appropriate.
+        # 2/4 used to land here too — but two simultaneous failures of those
+        # three is genuinely concerning and now downgrades to do_not_deploy.
         verdict = "conditional"
         verdict_text = (
             f"Conditional deploy — {passed_count}/4 checkpoints passed. "
-            "Address the failing conditions before production rollout."
+            "Address the failing condition before production rollout."
         )
     else:
         verdict = "do_not_deploy"

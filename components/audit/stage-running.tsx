@@ -1697,7 +1697,6 @@ function FairnessRow({
   const tprΔ = model.gaps.tpr_gap;
   const fprΔ = model.gaps.fpr_gap;
   const di = model.gaps.di_ratio;
-  const degeneracy = degenerateClassifier(model, groups);
   const isRunning = model.status === "running";
   const isError = model.status === "error";
 
@@ -1746,10 +1745,7 @@ function FairnessRow({
             style={{ background: color }}
           />
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="font-medium truncate">{model.name}</span>
-              {degeneracy && <DegenerateChip kind={degeneracy} />}
-            </div>
+            <span className="font-medium truncate">{model.name}</span>
             <div className="text-2xs text-ink-dim font-mono truncate">
               {model.family}
             </div>
@@ -1810,55 +1806,6 @@ function FairnessRow({
         )}
       </td>
     </tr>
-  );
-}
-
-/** A model is "degenerate" when its predict() output is constant across the
- *  data — predicting all-negative or all-positive. Looks "perfectly fair"
- *  on paper (every confusion-matrix gap = 0) but is clinically/decision-
- *  theoretically useless. Detected from selection rate across groups: every
- *  group at 0 → all-negative; every group at 1 → all-positive. */
-function degenerateClassifier(
-  model: Stage3Model,
-  groups: string[]
-): "all-negative" | "all-positive" | null {
-  const srs = groups
-    .map((g) => model.by_group[g]?.selection_rate)
-    .filter((v): v is number => v != null);
-  if (srs.length < 2) return null;
-  if (srs.every((s) => s === 0)) return "all-negative";
-  if (srs.every((s) => s === 1)) return "all-positive";
-  return null;
-}
-
-function DegenerateChip({
-  kind,
-}: {
-  kind: "all-negative" | "all-positive";
-}) {
-  const label =
-    kind === "all-negative" ? "predicts all 0" : "predicts all 1";
-  const tooltip =
-    kind === "all-negative"
-      ? "Model never predicts the positive class at threshold 0.5. Gaps are trivially zero — this is not a fair model, it's a useless one."
-      : "Model always predicts the positive class at threshold 0.5. Gaps are trivially zero — this is not a fair model, it's a useless one.";
-  return (
-    <span
-      title={tooltip}
-      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-warning/40 bg-warning/10 text-warning text-2xs font-mono uppercase tracking-wider whitespace-nowrap"
-    >
-      <svg width="9" height="9" viewBox="0 0 9 9" aria-hidden="true">
-        <path
-          d="M4.5 1L8 7.5H1L4.5 1Z M4.5 4V5.5 M4.5 6.5V6.6"
-          stroke="currentColor"
-          strokeWidth="1.1"
-          fill="none"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-        />
-      </svg>
-      {label}
-    </span>
   );
 }
 
