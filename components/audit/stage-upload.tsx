@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
-import { Button, Card } from "@/components/primitives";
+import { Button, Card, Logo } from "@/components/primitives";
 import { cn } from "@/lib/cn";
 import {
   formatBytes,
@@ -76,42 +76,32 @@ export function UploadStage({
     await inspectAndForward(parsed);
   }, [inspectAndForward]);
 
+  // Opening-page strict layout (top → bottom):
+  //   1) Centered NEXORA logo (animated, scale icon to the LEFT)
+  //   2) Subtitle
+  //   3) Short system description
+  //   4) File upload area
+  // No additional elements above the logo.
   return (
-    <div className="max-w-[1320px] mx-auto px-5 sm:px-8 py-12 sm:py-16">
-      <div className="grid lg:grid-cols-12 gap-12 items-start">
-        {/* Left: copy */}
-        <div className="lg:col-span-5">
-          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-4">
-            Step 1 — Upload
-          </div>
-          <h1 className="font-serif text-3xl leading-[1.05] tracking-tight text-ink mb-5">
-            Bring the dataset you'd train on.
-          </h1>
-          <p className="text-md text-ink-muted leading-relaxed mb-8">
-            Nexora runs entirely on the data you upload — no records leave
-            your browser during configuration. We need at least one column
-            you'd predict, and one demographic attribute you want to audit
-            fairness against.
-          </p>
+    <div className="min-h-screen flex flex-col items-center justify-center px-5 sm:px-8 py-16 sm:py-20">
+      <div className="w-full max-w-2xl flex flex-col items-center">
+        {/* 1 · Centered animated logo with scale icon to the left */}
+        <Logo size="lg" className="text-ink mb-7" />
 
-          <ul className="space-y-3 text-sm">
-            {[
-              { kbd: "CSV", text: "Comma-delimited, with a header row" },
-              { kbd: "≥30", text: "Observations per protected group, minimum" },
-              { kbd: "Binary", text: "Target column (positive / negative outcome)" },
-            ].map((r) => (
-              <li key={r.kbd} className="flex items-start gap-3">
-                <span className="font-mono text-2xs uppercase tracking-wider text-ink-dim border border-hairline rounded px-1.5 h-5 inline-flex items-center mt-0.5">
-                  {r.kbd}
-                </span>
-                <span className="text-ink-muted">{r.text}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
+        {/* 2 · Subtitle */}
+        <h1 className="font-serif text-2xl sm:text-3xl leading-tight tracking-tight text-ink text-center mb-3">
+          Bring the dataset you'd train on.
+        </h1>
 
-        {/* Right: dropzone */}
-        <div className="lg:col-span-7">
+        {/* 3 · Short system description */}
+        <p className="text-sm sm:text-md text-ink-muted leading-relaxed text-center max-w-xl mb-10">
+          A pre-deployment fairness audit. Upload a CSV, and Nexora trains five
+          model families on your data, statistically compares them, and
+          recommends the one that's fair to ship — before anyone is affected.
+        </p>
+
+        {/* 4 · File upload area */}
+        <div className="w-full">
           <input
             ref={inputRef}
             type="file"
@@ -208,6 +198,8 @@ export function UploadStage({
             </div>
           </Card>
 
+          {/* Format hints — auxiliary metadata, kept minimal so the
+              hierarchy stays logo → subtitle → description → upload. */}
           <div className="grid grid-cols-3 gap-2 mt-3 text-2xs font-mono text-ink-dim">
             <Format label="UTF-8" />
             <Format label="Quoted values OK" />

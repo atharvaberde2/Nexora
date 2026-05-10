@@ -1,9 +1,13 @@
 import type { Metadata } from "next";
-import { Inter, Instrument_Serif, JetBrains_Mono } from "next/font/google";
+import { Plus_Jakarta_Sans, Instrument_Serif, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({
+// Plus Jakarta Sans — modern, slightly warmer than Inter, very readable.
+// Same `--font-inter` CSS variable name kept for backward compatibility with
+// the existing Tailwind fontFamily mapping; only the underlying typeface changes.
+const sans = Plus_Jakarta_Sans({
   subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
   variable: "--font-inter",
   display: "swap",
 });
@@ -33,7 +37,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html
       lang="en"
-      className={`${inter.variable} ${instrument.variable} ${mono.variable}`}
+      className={`${sans.variable} ${instrument.variable} ${mono.variable}`}
     >
       <body className="bg-canvas text-ink font-sans antialiased">
         <div className="relative z-10">{children}</div>

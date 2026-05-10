@@ -1,17 +1,82 @@
 import { forwardRef, type ButtonHTMLAttributes, type HTMLAttributes } from "react";
 import { cn } from "@/lib/cn";
 
-/* ─────────────  Logo  ───────────── */
+/* ─────────────  Logo  ─────────────
+ *
+ * NEXORA wordmark with a balance-scale icon to the LEFT.
+ * Scale ⚖ → fairness / ML audit / justice.
+ *
+ * Letter-by-letter assembly: each letter rises and fades in, staggered 70ms.
+ * The animation runs once on mount via the CSS keyframes in globals.css.
+ *
+ * `size`: "sm" for nav (default, small), "lg" for the centered hero on the
+ * opening page. Scale icon and text scale together; animation works for both.
+ */
 
-export function Logo({ className }: { className?: string }) {
+const NEXORA_LETTERS = ["N", "E", "X", "O", "R", "A"] as const;
+
+export function Logo({
+  className,
+  size = "sm",
+}: {
+  className?: string;
+  size?: "sm" | "lg";
+}) {
+  const isLg = size === "lg";
+  const iconPx = isLg ? 36 : 18;
+  const gap = isLg ? "gap-3" : "gap-2";
+  const letterCls = isLg
+    ? "font-serif text-[44px] sm:text-[56px] tracking-[-0.02em] leading-none"
+    : "font-medium tracking-tight text-[15px] leading-none";
+
   return (
-    <div className={cn("flex items-center gap-2", className)}>
-      <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-        <path d="M9 1.5v15M2 4.5h14M4.5 4.5L2 10.5h5L4.5 4.5zM13.5 4.5L11 10.5h5l-2.5-6z" stroke="#F5F6F7" strokeWidth="1.25" strokeLinejoin="round" fill="none" />
-        <circle cx="4.5" cy="14.5" r="1.5" fill="#5B7FFF" />
-      </svg>
-      <span className="font-medium tracking-tight text-[15px]">Nexora</span>
+    <div className={cn("inline-flex items-center", gap, className)} aria-label="Nexora">
+      {/* Balance scale — fairness symbol, baseline-aligned with the wordmark */}
+      <ScaleIcon size={iconPx} className="logo-scale shrink-0" />
+      <span className={cn(letterCls, "select-none")}>
+        {NEXORA_LETTERS.map((char, i) => (
+          <span
+            key={i}
+            className="logo-letter"
+            style={{ animationDelay: `${120 + i * 70}ms` }}
+          >
+            {char}
+          </span>
+        ))}
+      </span>
     </div>
+  );
+}
+
+/** Two-pan balance scale — the fairness/justice mark. Baseline-aligned with
+ *  the wordmark via viewBox bottom edge. Stroke uses currentColor so it picks
+ *  up the text color of the parent. */
+function ScaleIcon({ size, className }: { size: number; className?: string }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      className={className}
+      aria-hidden="true"
+      fill="none"
+    >
+      {/* Vertical column */}
+      <path d="M12 3.5V21" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      {/* Base */}
+      <path d="M8 21H16" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      {/* Crossbeam */}
+      <path d="M4 7H20" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      {/* Top knob */}
+      <circle cx="12" cy="3.5" r="1" fill="currentColor" />
+      {/* Left pan: triangle from (4,7) hanging by short threads */}
+      <path d="M4 7L1.6 12.2H6.4L4 7Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      {/* Right pan */}
+      <path d="M20 7L17.6 12.2H22.4L20 7Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      {/* Subtle accent under the right pan to suggest balance/equity */}
+      <path d="M1.6 12.2H6.4" stroke="#738BF2" strokeWidth="1.3" strokeLinecap="round" opacity="0.85" />
+      <path d="M17.6 12.2H22.4" stroke="#738BF2" strokeWidth="1.3" strokeLinecap="round" opacity="0.85" />
+    </svg>
   );
 }
 

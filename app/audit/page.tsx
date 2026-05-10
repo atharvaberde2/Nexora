@@ -31,10 +31,15 @@ export default function AuditPage() {
       ? "Running"
       : "Audit complete";
 
+  // Opening-page rule: on the upload stage, the centered animated logo is the
+  // first element on the page — no nav, no stage rail above it. Every other
+  // stage keeps the standard chrome (Nav with logo on the left, StageRail).
+  const isOpeningPage = stage === "upload";
+
   return (
     <main className="min-h-screen">
-      <Nav context={navContext} status={navStatus} />
-      <StageRail active={stage} />
+      {!isOpeningPage && <Nav context={navContext} status={navStatus} />}
+      {!isOpeningPage && <StageRail active={stage} />}
 
       <div key={stage} className="animate-fade-up">
         {stage === "upload" && (

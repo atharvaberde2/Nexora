@@ -7,15 +7,15 @@
 }
 
 html, body {
-  background: #08090B;
-  color: #F5F6F7;
+  background: #0C0E13;
+  color: #EAECEF;
   font-feature-settings: "ss01", "cv11";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
-::selection { background: rgba(91,127,255,0.32); color: #F5F6F7; }
+::selection { background: rgba(115,139,242,0.32); color: #EAECEF; }
 
 /* Subtle grain — keeps surfaces from feeling sterile at large sizes */
 body::before {
@@ -25,6 +25,26 @@ body::before {
   background-image: radial-gradient(rgba(255,255,255,0.018) 1px, transparent 1px);
   background-size: 3px 3px;
   z-index: 0;
+}
+
+/* Logo: letter-by-letter assembly. Each letter rises + fades into place,
+   staggered by 70ms. Smooth, professional, runs once on mount. */
+@keyframes letter-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.logo-letter {
+  display: inline-block;
+  opacity: 0;
+  animation: letter-rise 480ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+@keyframes scale-fade-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.logo-scale {
+  opacity: 0;
+  animation: scale-fade-in 520ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 
 /* Hairline grid utility */
@@ -44,7 +64,7 @@ body::before {
 
 /* Focus rings — accessible without being loud */
 :focus-visible {
-  outline: 2px solid rgba(91,127,255,0.6);
+  outline: 2px solid rgba(115,139,242,0.6);
   outline-offset: 2px;
   border-radius: 6px;
 }
@@ -52,8 +72,8 @@ body::before {
 /* Scrollbar — minimal */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #1F232B; border-radius: 10px; border: 2px solid #08090B; }
-::-webkit-scrollbar-thumb:hover { background: #2A2F37; }
+::-webkit-scrollbar-thumb { background: #22262F; border-radius: 10px; border: 2px solid #0C0E13; }
+::-webkit-scrollbar-thumb:hover { background: #2D323C; }
 
 /* Hide arrow on number inputs, etc. */
 input[type="number"]::-webkit-outer-spin-button,

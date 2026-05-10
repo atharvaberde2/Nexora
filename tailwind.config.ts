@@ -5,31 +5,35 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        canvas: "#08090B",
-        surface: "#0F1115",
-        elevated: "#161A20",
-        hairline: "#1F232B",
-        line: "#2A2F37",
+        // Softened palette: subtle warming on the dark surfaces and gentler
+        // semantic colors to reduce the "robotic console" feel without losing
+        // the clean professional dark theme. Contrast ratios still ≥ 4.5:1
+        // for text on canvas (WCAG AA).
+        canvas: "#0C0E13",
+        surface: "#14161C",
+        elevated: "#1A1D25",
+        hairline: "#22262F",
+        line: "#2D323C",
         ink: {
-          DEFAULT: "#F5F6F7",
-          muted: "#9BA1AB",
-          dim: "#6B7280",
-          faint: "#3F4651",
+          DEFAULT: "#EAECEF",
+          muted: "#A8AEB8",
+          dim: "#737A85",
+          faint: "#444A55",
         },
         accent: {
-          DEFAULT: "#5B7FFF",
-          soft: "rgba(91, 127, 255, 0.14)",
-          ring: "rgba(91, 127, 255, 0.32)",
+          DEFAULT: "#738BF2",
+          soft: "rgba(115, 139, 242, 0.14)",
+          ring: "rgba(115, 139, 242, 0.32)",
         },
-        success: "#4ADE80",
-        warning: "#FBBF24",
-        danger: "#F87171",
-        // Model series — muted but distinct
-        m1: "#9CA3AF", // logistic
-        m2: "#A78BFA", // random forest
-        m3: "#F87171", // xgboost
-        m4: "#34D399", // lightgbm
-        m5: "#FBBF24", // svm
+        success: "#5DC78A",
+        warning: "#E5B95A",
+        danger: "#E68585",
+        // Model series — softened to match palette
+        m1: "#A4ABB6", // logistic
+        m2: "#B4A0F5", // random forest
+        m3: "#E68585", // xgboost
+        m4: "#5BCFA1", // lightgbm
+        m5: "#E5B95A", // svm
       },
       fontFamily: {
         sans: ["var(--font-inter)", "system-ui", "sans-serif"],
@@ -65,9 +69,9 @@ const config: Config = {
         "2xl": "20px",
       },
       boxShadow: {
-        "panel": "0 1px 0 rgba(255,255,255,0.04) inset, 0 0 0 1px #1F232B",
-        "lift": "0 1px 0 rgba(255,255,255,0.06) inset, 0 0 0 1px #2A2F37, 0 12px 40px -16px rgba(0,0,0,0.6)",
-        "glow": "0 0 0 1px rgba(91,127,255,0.4), 0 0 32px -4px rgba(91,127,255,0.4)",
+        "panel": "0 1px 0 rgba(255,255,255,0.04) inset, 0 0 0 1px #22262F",
+        "lift": "0 1px 0 rgba(255,255,255,0.06) inset, 0 0 0 1px #2D323C, 0 12px 40px -16px rgba(0,0,0,0.55)",
+        "glow": "0 0 0 1px rgba(115,139,242,0.4), 0 0 32px -4px rgba(115,139,242,0.4)",
       },
       keyframes: {
         "fade-up": {
