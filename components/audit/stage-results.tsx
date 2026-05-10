@@ -380,7 +380,7 @@ function Legend({
 
 /** Hero shown when Stage 8's verdict is not "deploy". Replaces the
  *  recommended-model card with the canonical "No safe model exists under
- *  current data conditions" headline + diagnosis. */
+ *  current data conditions" headline + diagnosis + data-intervention strategy. */
 function BlockedHero({
   stage7,
   stage8,
@@ -406,6 +406,13 @@ function BlockedHero({
     stage8.fairness_risk.statistical_root_cause ??
     "unknown";
   const rootCause = humanRootCause(rootCauseRaw);
+  const intervention = stage8.deployment.data_intervention;
+  const KIND_LABEL: Record<string, string> = {
+    clean: "Clean existing data",
+    collect: "Collect new data",
+    both: "Clean + collect",
+    manual_review: "Escalate to manual review",
+  };
 
   return (
     <section className="border-b border-hairline">
@@ -425,12 +432,78 @@ function BlockedHero({
           <p className="text-sm text-ink-muted leading-relaxed mb-5 max-w-[58ch]">
             {rationale}
           </p>
-          <div className="rounded-md border border-hairline bg-elevated/40 px-4 py-3 text-xs text-ink-muted leading-relaxed">
+          <div className="rounded-md border border-hairline bg-elevated/40 px-4 py-3 text-xs text-ink-muted leading-relaxed mb-4">
             <span className="font-mono uppercase tracking-wider text-2xs text-ink-dim mr-2">
               Verdict
             </span>
             {verdictText}
           </div>
+          {intervention && (
+            <div className="rounded-md border border-warning/30 bg-warning/[0.06] p-4">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-2xs uppercase tracking-[0.16em] text-ink-dim">
+                  What to do with the data
+                </div>
+                <div className="flex items-center gap-2">
+                  {intervention.is_primary_issue && (
+                    <Badge tone="danger" dot>Primary issue</Badge>
+                  )}
+                  <Badge
+                    tone={
+                      intervention.kind === "clean"
+                        ? "accent"
+                        : intervention.kind === "manual_review"
+                        ? "neutral"
+                        : "warning"
+                    }
+                    dot
+                  >
+                    {KIND_LABEL[intervention.kind] ?? intervention.kind}
+                  </Badge>
+                </div>
+              </div>
+              <div className="text-sm text-ink mb-1.5 font-medium">
+                {intervention.headline}
+              </div>
+              <p className="text-xs text-ink-muted leading-relaxed mb-3">
+                {intervention.rationale}
+              </p>
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-2xs font-mono uppercase tracking-wider">
+                <span className={intervention.can_cleaning_alone_fix ? "text-success" : "text-ink-dim"}>
+                  cleaning alone {intervention.can_cleaning_alone_fix ? "fixes it" : "is not enough"}
+                </span>
+                <span className={intervention.requires_new_collection ? "text-warning" : "text-ink-dim"}>
+                  new collection {intervention.requires_new_collection ? "required" : "not required"}
+                </span>
+                <span
+                  className={
+                    intervention.confidence >= 0.7
+                      ? "text-success"
+                      : intervention.confidence >= 0.5
+                      ? "text-warning"
+                      : "text-danger"
+                  }
+                >
+                  confidence {(intervention.confidence * 100).toFixed(0)}%
+                </span>
+              </div>
+              {intervention.signals.length > 0 && (
+                <details className="mt-3 text-xs text-ink-muted">
+                  <summary className="text-2xs uppercase tracking-[0.16em] text-ink-dim cursor-pointer hover:text-ink">
+                    Evidence ({intervention.signals.length})
+                  </summary>
+                  <ul className="mt-2 space-y-1">
+                    {intervention.signals.map((s, i) => (
+                      <li key={i} className="flex items-start gap-2 leading-snug">
+                        <span className="text-ink-dim font-mono mt-0.5 shrink-0">·</span>
+                        <span>{s}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+            </div>
+          )}
         </Card>
 
         <Card className="lg:col-span-4 p-6">

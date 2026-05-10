@@ -97,6 +97,9 @@ export async function runStage1(
   fd.append("target", cfg.target);
   for (const p of cfg.protectedAttrs) fd.append("protected", p);
   fd.append("positive_class", cfg.positiveClass);
+  if (cfg.labelsAuditable !== null) {
+    fd.append("labels_auditable", cfg.labelsAuditable ? "yes" : "no");
+  }
 
   const res = await fetch(`${API_BASE}/api/audit/stage/1`, {
     method: "POST",
@@ -173,6 +176,9 @@ export async function runStage2Stream(
   fd.append("target", cfg.target);
   for (const p of cfg.protectedAttrs) fd.append("protected", p);
   fd.append("positive_class", cfg.positiveClass);
+  if (cfg.labelsAuditable !== null) {
+    fd.append("labels_auditable", cfg.labelsAuditable ? "yes" : "no");
+  }
 
   const res = await fetch(`${API_BASE}/api/audit/stage/2`, {
     method: "POST",
@@ -488,6 +494,10 @@ export type Stage5PerAttr = {
   group_positive_rates: Record<string, number | null>;
   group_shap: Record<string, Stage5GroupShap>;
   proxy_features: Stage5ProxyFeature[];
+  /** [0, 1] — share of the MAJORITY group's total SHAP importance carried by
+   *  the top proxy feature. High means the proxy also carries legitimate
+   *  signal (not safely removable); low means it's a "pure" proxy. */
+  proxy_substitutability: number | null;
   correlated_features: Stage5CorrFeature[];
   permutation_test: {
     p_value: number | null;
@@ -685,12 +695,31 @@ export type DataRemediationAction = {
   success_criteria: string[];
 };
 
+export type DataStrategy = {
+  /** clean = existing data is salvageable, collect = need more samples,
+   *  both = clean first then collect, manual_review = diagnosis incomplete. */
+  kind: "clean" | "collect" | "both" | "manual_review";
+  /** Verbatim one-sentence verdict the deployment tab can render. */
+  headline: string;
+  /** 2–3 sentence rationale shown beneath the headline. */
+  rationale: string;
+  can_cleaning_alone_fix: boolean;
+  requires_new_collection: boolean;
+  /** [0, 1] confidence in this kind. <0.5 = first-guess, surface manual review. */
+  confidence: number;
+  /** Human-readable evidence rules that fired, so a reviewer can audit the verdict. */
+  signals: string[];
+};
+
 export type DataRemediation = {
   triggered: boolean;
   headline: string;
   root_cause: string;
   rationale: string;
   actions: DataRemediationAction[];
+  /** Always populated, even when triggered=false, so Stage 8 can show "what
+   *  to do with the data" on the conditional / do-not-deploy paths. */
+  strategy: DataStrategy;
 };
 
 export type Stage7Response = {
@@ -798,12 +827,30 @@ export type Stage8DeploymentCondition = {
   detail: string;
 };
 
+export type Stage8DataIntervention = {
+  kind: "clean" | "collect" | "both" | "manual_review";
+  headline: string;
+  rationale: string;
+  can_cleaning_alone_fix: boolean;
+  requires_new_collection: boolean;
+  /** True when the data is the primary issue — fires when CP4 returned
+   *  no_recommendation OR ≤2/4 deployment conditions passed. */
+  is_primary_issue: boolean;
+  /** [0, 1] verdict confidence. */
+  confidence: number;
+  /** Evidence rules that fired during classification. Display as bullets. */
+  signals: string[];
+};
+
 export type Stage8Deployment = {
   verdict: "deploy" | "conditional" | "do_not_deploy";
   verdict_text: string;
   passed_count: number;
   total_conditions: number;
   conditions: Stage8DeploymentCondition[];
+  /** Set whenever verdict !== "deploy". Tells the user what to do with the
+   *  data: clean, collect, both, or escalate. */
+  data_intervention: Stage8DataIntervention | null;
 };
 
 export type Stage8Response = {

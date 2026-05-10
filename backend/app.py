@@ -40,14 +40,18 @@ except Exception:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
 try:
-    import google.generativeai as genai
+    from google import genai as _genai
+    from google.genai import types as _genai_types
     if GEMINI_API_KEY:
-        genai.configure(api_key=GEMINI_API_KEY)
+        _gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
         HAS_GEMINI = True
     else:
+        _gemini_client = None
         HAS_GEMINI = False
 except Exception:
-    genai = None  # type: ignore[assignment]
+    _genai = None  # type: ignore[assignment]
+    _genai_types = None  # type: ignore[assignment]
+    _gemini_client = None
     HAS_GEMINI = False
 
 
@@ -64,21 +68,21 @@ def _gemini_narrate(
     `max_output_tokens` defaults to 2048 because gemini-2.5-flash uses internal
     "thinking" tokens that count against this budget — a smaller cap gets
     consumed by thinking and produces empty visible output."""
-    if not HAS_GEMINI or genai is None:
+    if not HAS_GEMINI or _gemini_client is None or _genai_types is None:
         return None
     try:
-        kwargs = {}
-        if system:
-            kwargs["system_instruction"] = system
-        model = genai.GenerativeModel(GEMINI_MODEL, **kwargs)
-        resp = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.2,
-                "max_output_tokens": max_output_tokens,
-                "response_mime_type": "application/json"
-                if "JSON" in (prompt or "") else "text/plain",
-            },
+        config = _genai_types.GenerateContentConfig(
+            system_instruction=system if system else None,
+            temperature=0.2,
+            max_output_tokens=max_output_tokens,
+            response_mime_type=(
+                "application/json" if "JSON" in (prompt or "") else "text/plain"
+            ),
+        )
+        resp = _gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=config,
         )
         text = (getattr(resp, "text", None) or "").strip()
         if not text:
@@ -1017,6 +1021,17 @@ def stage_2():
     target = (request.form.get("target") or "").strip()
     positive_class = request.form.get("positive_class")
 
+    # Optional user-supplied flag from the Configure stage. Tri-state: "yes" /
+    # "no" / unset. Stored in the session and read by Stage 7 to refine the
+    # label_bias data-strategy branch.
+    raw_la = (request.form.get("labels_auditable") or "").strip().lower()
+    if raw_la in {"yes", "true", "1"}:
+        labels_auditable: bool | None = True
+    elif raw_la in {"no", "false", "0"}:
+        labels_auditable = False
+    else:
+        labels_auditable = None
+
     raw_protected = request.form.getlist("protected") or []
     if not raw_protected:
         single = request.form.get("protected")
@@ -1144,6 +1159,7 @@ def stage_2():
             "positive_class": str(positive_class),
             "predictions": session_predictions,
             "models": completed_models,
+            "labels_auditable": labels_auditable,
             "created_at": time.time(),
         })
 
@@ -1741,6 +1757,41 @@ def _group_shap_importance(
     }
 
 
+def _proxy_substitutability(
+    proxy_feats: list[dict],
+    group_shap: dict[str, dict],
+    group_sizes: dict[str, int],
+) -> float | None:
+    """How much of the MAJORITY group's predictive signal does the top proxy
+    feature carry? In [0, 1]. Returns None when no proxy was detected or
+    when SHAP wasn't available.
+
+    Interpretation:
+    - High (≥ 0.40): the proxy carries substantial majority-group signal too,
+      so removing it would degrade overall AUC — cleaning isn't free, and
+      the data strategy should escalate to manual review.
+    - Low (≤ 0.10): the proxy is asymmetric (high importance for the minority
+      group, low for the majority) — i.e. a "pure" proxy. Removing it is cheap
+      and 'clean' is a safe data strategy.
+
+    No retraining required — derived purely from existing SHAP importances,
+    so it's a O(features) read against data already in memory.
+    """
+    if not proxy_feats or not group_shap or not group_sizes:
+        return None
+    # Majority = group with the most samples.
+    majority = max(group_sizes, key=lambda g: group_sizes.get(g, 0))
+    importance_map = (group_shap.get(majority) or {}).get("importance") or {}
+    if not importance_map:
+        return None
+    total = sum(v for v in importance_map.values() if v is not None and v > 0)
+    if total <= 0:
+        return None
+    top = proxy_feats[0].get("feature")
+    top_imp = importance_map.get(top) or 0.0
+    return _safe_float(float(top_imp) / float(total))
+
+
 def _proxy_features(
     group_shap: dict[str, dict], groups: list[str], ratio_threshold: float = 2.0
 ) -> list[dict]:
@@ -2106,12 +2157,19 @@ def stage_5():
             for g in groups
         }
 
+        # Substitutability of the top proxy feature on the majority group —
+        # 0..1 score, drives Stage 7's clean-vs-escalate decision when the
+        # diagnosed cause is proxy_discrimination. None when no proxy was
+        # detected or SHAP was unavailable.
+        proxy_sub = _proxy_substitutability(proxy_feats, group_shap, group_sizes)
+
         results[col] = {
             "groups": groups,
             "group_sizes": group_sizes,
             "group_positive_rates": group_pos_rates,
             "group_shap": group_shap,
             "proxy_features": proxy_feats,
+            "proxy_substitutability": proxy_sub,
             "correlated_features": corr_feats,
             "permutation_test": {
                 "p_value": perm_p,
@@ -2631,15 +2689,42 @@ class DataRemediationAction(BaseModel):
     success_criteria: list[str] = Field(default_factory=list)
 
 
+class DataStrategy(BaseModel):
+    """High-level verdict on what the user should do with their data when the
+    pipeline blocks a deployment. Answers two questions a non-ML stakeholder
+    actually asks: 'is the data the problem?' and 'do I need new data, or can
+    I clean what I have?'
+
+    `confidence` is in [0, 1] — a 0.85 confidence means most of the inputs we
+    inspected pointed the same way. Below ~0.5, the UI should advise treating
+    the kind as 'first guess' and surface manual review prominently.
+
+    `signals` lists the human-readable evidence rules that fired during
+    classification, so a reviewer can audit why this verdict was issued.
+    """
+    kind: Literal["clean", "collect", "both", "manual_review"]
+    headline: str           # one-sentence summary the deployment tab can show verbatim
+    rationale: str          # 2–3 sentence explanation of why this is the right strategy
+    can_cleaning_alone_fix: bool
+    requires_new_collection: bool
+    confidence: float = 0.5
+    signals: list[str] = Field(default_factory=list)
+
+
 class DataRemediation(BaseModel):
     """Dataset-level remediation surfaced ONLY when CP4.pareto_status is
     'no_recommendation' — i.e. every candidate model was blocked by Stage 4
-    or Stage 7. Maps Stage 5 / CP3 root cause to data-cleaning steps."""
+    or Stage 7. Maps Stage 5 / CP3 root cause to data-cleaning steps.
+
+    `strategy` is always populated (whether or not `triggered` is True) so
+    Stage 8 can show 'what to do with the data' even when a model is technically
+    recommended but the deployment checklist is failing."""
     triggered: bool
     headline: str = ""  # "No safe model exists under current data conditions"
     root_cause: str = "unknown"
     rationale: str = ""
     actions: list[DataRemediationAction] = Field(default_factory=list)
+    strategy: DataStrategy
 
 
 class Stage7Narratives(BaseModel):
@@ -3005,21 +3090,380 @@ def _cp4_final_gate(stage4: dict) -> CP4FinalRecommendation:
     )
 
 
+# Threshold knobs — kept as named constants so the rationale strings can cite
+# them directly and reviewers don't have to grep for magic numbers.
+_DS_RATIO_EXTREME = 5.0   # majority/minority sample ratio above this → collect-only
+_DS_RATIO_MILD = 2.0      # ratio below this → cleaning is plausible (no extra weight needed)
+_DS_MIN_ABS_N = 100       # minority absolute n below this → bootstrap CIs unreliable
+_DS_PROXY_SUB_HIGH = 0.40 # proxy SHAP-importance contribution above this on majority → not safely removable
+_DS_PROXY_SUB_LOW = 0.10  # below this → proxy is "pure" (cheaply removable)
+
+
+def _classify_data_strategy(
+    cause: str,
+    minority_n: int | None,
+    majority_n: int | None,
+    *,
+    severity: str | None = None,
+    underrepresented_group_count: int = 1,
+    underrepresented_total_n: int | None = None,
+    proxy_substitutability: float | None = None,
+    labels_auditable: bool | None = None,
+    diagnosis_disagreed: bool = False,
+) -> "DataStrategy":
+    """Decide whether the user should clean, collect, do both, or escalate to
+    manual review. Driven by the diagnosed root cause + the actual statistical
+    state of the data (severity, group sizes, proxy substitutability, label
+    auditability). Returns a `DataStrategy` with a confidence score and the
+    list of signals that fired so a reviewer can audit the verdict.
+
+    Inputs:
+    - cause: the FINAL root cause Stage 7 settled on (after CP3 disagreement
+      bumping). One of: representation_bias, label_bias, proxy_discrimination,
+      threshold_effect, unknown.
+    - minority_n / majority_n: sample counts for the smallest and largest
+      groups in the primary protected attribute.
+    - severity: cp1.severity ∈ {low, medium, high}. High severity escalates
+      representation_bias toward collect-only.
+    - underrepresented_group_count: how many groups beyond the smallest are
+      below the under-representation cutoff. >1 means multi-group disparity,
+      not a clean two-group story.
+    - underrepresented_total_n: aggregate n across ALL underrepresented
+      groups; used in place of just `minority_n` when there are >2 groups.
+    - proxy_substitutability: 0..1 score from Stage 5 measuring how much of
+      the MAJORITY group's predictive signal the top proxy feature carries.
+      High → removing the proxy kills legitimate AUC → cleaning isn't enough.
+    - labels_auditable: user-supplied flag (Configure stage). False means the
+      original labeling process can't be cleanly re-derived, so cleaning
+      labels in place isn't possible — collect-only.
+    - diagnosis_disagreed: CP3 statistical-vs-ML disagreement. Pulls
+      confidence down across the board (we may have picked the wrong cause).
+    """
+    # Fall back to the smallest group's n if we don't have a multi-group total.
+    effective_n = (
+        underrepresented_total_n
+        if underrepresented_total_n is not None
+        else minority_n
+    )
+    ratio = (
+        majority_n / max(effective_n or 0, 1)
+        if effective_n is not None and majority_n is not None and effective_n > 0
+        else None
+    )
+    sev = (severity or "low").lower()
+    signals: list[str] = []
+
+    # ───────── proxy_discrimination ─────────
+    if cause == "proxy_discrimination":
+        ps = proxy_substitutability
+        if ps is not None and ps >= _DS_PROXY_SUB_HIGH:
+            # The proxy carries substantive predictive signal for the majority
+            # group too — removing it isn't free. Cleaning alone won't work.
+            signals.append(
+                f"proxy substitutability {ps:.2f} ≥ {_DS_PROXY_SUB_HIGH:.2f} "
+                "(top proxy feature carries legitimate signal for majority)"
+            )
+            confidence = 0.85 - (0.15 if diagnosis_disagreed else 0.0)
+            return DataStrategy(
+                kind="manual_review",
+                headline="Proxy isn't cheaply removable — escalate to manual review.",
+                rationale=(
+                    "The top proxy feature also carries substantial predictive signal "
+                    "for the majority group. Removing it would degrade overall AUC "
+                    "and may not be acceptable. A domain expert must decide whether "
+                    "to drop it, replace it with a non-proxy alternative, or accept "
+                    "the substitutability trade-off."
+                ),
+                can_cleaning_alone_fix=False,
+                requires_new_collection=False,
+                confidence=max(0.0, confidence),
+                signals=signals,
+            )
+        if ps is not None and ps <= _DS_PROXY_SUB_LOW:
+            signals.append(
+                f"proxy substitutability {ps:.2f} ≤ {_DS_PROXY_SUB_LOW:.2f} "
+                "(pure proxy, cheap to remove)"
+            )
+            confidence_base = 0.90
+        else:
+            signals.append(
+                "proxy substitutability not available — defaulting to clean"
+                if ps is None
+                else f"proxy substitutability {ps:.2f} in mid-range — cleaning likely OK"
+            )
+            confidence_base = 0.70
+        return DataStrategy(
+            kind="clean",
+            headline="Cleaning the existing dataset is sufficient.",
+            rationale=(
+                "Proxy features can be removed or orthogonalized from the existing "
+                "data — collecting more samples does not change the proxy structure. "
+                "Once the schema is cleaned, retrain and re-audit."
+            ),
+            can_cleaning_alone_fix=True,
+            requires_new_collection=False,
+            confidence=max(0.0, confidence_base - (0.15 if diagnosis_disagreed else 0.0)),
+            signals=signals,
+        )
+
+    # ───────── representation_bias ─────────
+    if cause == "representation_bias":
+        # Score weights chosen so that ANY of these signals alone is sufficient
+        # to escalate from "both" to "collect-only":
+        #   - extreme imbalance ratio (>5x)
+        #   - severity = high (Stage 1 saw multiple adverse signals)
+        #   - underrepresented n < 100 (subgroup CIs unreliable regardless)
+        # Moderate imbalance and multi-group disparity are weaker signals on
+        # their own but combine with severity / low-n.
+        score = 0
+        if ratio is not None and ratio > _DS_RATIO_EXTREME:
+            score += 3
+            signals.append(f"imbalance ratio {ratio:.1f}× > {_DS_RATIO_EXTREME:.1f}×")
+        elif ratio is not None and ratio > _DS_RATIO_MILD:
+            score += 1
+            signals.append(f"imbalance ratio {ratio:.1f}× moderate (>{_DS_RATIO_MILD:.1f}×)")
+        if effective_n is not None and effective_n < _DS_MIN_ABS_N:
+            score += 3
+            signals.append(
+                f"underrepresented n = {effective_n} < {_DS_MIN_ABS_N} "
+                "(bootstrap CIs unreliable)"
+            )
+        if sev == "high":
+            score += 2
+            signals.append("Stage 1 severity = high")
+        if underrepresented_group_count > 1:
+            score += 1
+            signals.append(
+                f"{underrepresented_group_count} groups under-represented "
+                "(multi-group disparity, not clean min-vs-max)"
+            )
+
+        # score ≥ 3 → collect-only; score 1–2 → both; score 0 → both.
+        # (representation bias always needs collection eventually; the question
+        # is whether cleaning is even worth attempting in the meantime).
+        if score >= 3:
+            confidence = 0.80 + min(0.10, 0.02 * score)
+            return DataStrategy(
+                kind="collect",
+                headline="New data collection is required — cleaning alone will not fix this.",
+                rationale=(
+                    f"Multiple signals point the same way: imbalance "
+                    f"{(f'{ratio:.1f}× ' if ratio else '')}"
+                    f"{('with ' + str(effective_n) + ' underrepresented samples') if effective_n else ''}"
+                    f"{(' and ' + sev + ' severity') if sev == 'high' else ''}. "
+                    "Synthetic resampling (SMOTE, class weights) inflates uncertainty "
+                    "without adding information; subgroup metrics will remain unreliable. "
+                    "Collect more real samples from the underrepresented groups before retraining."
+                ),
+                can_cleaning_alone_fix=False,
+                requires_new_collection=True,
+                confidence=max(0.0, min(0.95, confidence) - (0.15 if diagnosis_disagreed else 0.0)),
+                signals=signals,
+            )
+        confidence = 0.60 + min(0.15, 0.05 * score)
+        return DataStrategy(
+            kind="both",
+            headline="Both cleaning and new collection are needed — cleaning alone is a short-term fix.",
+            rationale=(
+                "Stratified resampling and inverse-frequency weighting on the existing "
+                "data are reasonable interim steps. The durable fix is targeted "
+                "collection from the underrepresented group; without it, subgroup CIs "
+                "stay wide."
+            ),
+            can_cleaning_alone_fix=False,
+            requires_new_collection=True,
+            confidence=max(0.0, confidence - (0.15 if diagnosis_disagreed else 0.0)),
+            signals=signals,
+        )
+
+    # ───────── label_bias ─────────
+    if cause == "label_bias":
+        if labels_auditable is False:
+            signals.append(
+                "labels marked NOT auditable — in-place cleaning impossible"
+            )
+            return DataStrategy(
+                kind="collect",
+                headline="Fresh labels are required — existing labels cannot be cleaned.",
+                rationale=(
+                    "The original labeling criteria are not documented or auditable, "
+                    "so an in-place audit cannot reliably correct them. Re-label from "
+                    "a less biased process (or collect new ground truth) before any "
+                    "retraining."
+                ),
+                can_cleaning_alone_fix=False,
+                requires_new_collection=True,
+                confidence=max(0.0, 0.85 - (0.15 if diagnosis_disagreed else 0.0)),
+                signals=signals,
+            )
+        if labels_auditable is True:
+            signals.append("labels marked auditable — clean-in-place is plausible")
+            return DataStrategy(
+                kind="both",
+                headline="Audit and recalibrate existing labels first; collect fresh labels if audit fails.",
+                rationale=(
+                    "Run a stratified label audit with domain experts on the existing "
+                    "data. If the audit confirms systematic per-group label drift that "
+                    "can be corrected, cleaning may suffice. Otherwise, fresh labels "
+                    "from a less biased process are required."
+                ),
+                can_cleaning_alone_fix=False,
+                requires_new_collection=True,
+                confidence=max(0.0, 0.70 - (0.15 if diagnosis_disagreed else 0.0)),
+                signals=signals,
+            )
+        # labels_auditable not specified — conservative both
+        signals.append("label auditability not specified — defaulting to both")
+        return DataStrategy(
+            kind="both",
+            headline="Both label cleaning and (likely) fresh labels are needed.",
+            rationale=(
+                "First, audit and recalibrate the existing labels with domain experts "
+                "on a stratified sample. If the historical labeling process cannot be "
+                "cleanly re-derived, fresh labels from a less biased process — "
+                "effectively new ground truth — are required before any retraining."
+            ),
+            can_cleaning_alone_fix=False,
+            requires_new_collection=True,
+            confidence=max(0.0, 0.55 - (0.15 if diagnosis_disagreed else 0.0)),
+            signals=signals,
+        )
+
+    # ───────── threshold_effect ─────────
+    if cause == "threshold_effect":
+        signals.append(
+            "threshold-effect cause is normally model-level; reaching 'no model safe' "
+            "implies the diagnosis is incomplete"
+        )
+        return DataStrategy(
+            kind="manual_review",
+            headline="Data may not be the primary issue — escalate to manual review.",
+            rationale=(
+                "Threshold effects are normally addressable at the model level. The "
+                "deployment was still blocked, which suggests the diagnosis is "
+                "incomplete — investigate before applying any data change."
+            ),
+            can_cleaning_alone_fix=False,
+            requires_new_collection=False,
+            confidence=max(0.0, 0.65 - (0.15 if diagnosis_disagreed else 0.0)),
+            signals=signals,
+        )
+
+    # ───────── unknown / fallback ─────────
+    signals.append("root cause undetermined")
+    return DataStrategy(
+        kind="manual_review",
+        headline="Root cause is undetermined — manual diagnosis required first.",
+        rationale=(
+            "No data-cleaning recipe is safe to recommend automatically without a "
+            "confirmed root cause. Have a domain expert inspect the Stage 1 fingerprint, "
+            "feature schema, and labeling process before any retraining or data modification."
+        ),
+        can_cleaning_alone_fix=False,
+        requires_new_collection=False,
+        confidence=0.30,
+        signals=signals,
+    )
+
+
+def _strategy_inputs_from_stage1(stage1: dict) -> dict:
+    """Pull every group-size statistic the strategy classifier needs from
+    Stage 1's bias fingerprint. Returns minority/majority counts plus the
+    multi-group aggregate (count + total n of underrepresented groups), and
+    the bias-fingerprint severity."""
+    s1_results = stage1.get("results") or []
+    primary = (
+        max(s1_results, key=lambda r: len(r.get("fingerprint", {}).get("groups", [])))
+        if s1_results
+        else {"fingerprint": {}}
+    )
+    fp = primary.get("fingerprint", {}) or {}
+    groups = fp.get("groups") or []
+    sized = sorted(groups, key=lambda g: g.get("n", 0)) if groups else []
+    if not sized:
+        return {
+            "minority_n": None, "majority_n": None,
+            "underrepresented_group_count": 1,
+            "underrepresented_total_n": None,
+            "severity": fp.get("severity"),
+        }
+    minority_n = sized[0].get("n")
+    majority_n = sized[-1].get("n")
+    # "Underrepresented" = group whose n is < majority/2 (a 2× cutoff is the
+    # standard 'mild imbalance' boundary). We aggregate ALL such groups, not
+    # just the smallest, so multi-group disparities don't get flattened.
+    if majority_n:
+        threshold = majority_n / 2
+        under = [g for g in sized[:-1] if g.get("n", 0) < threshold]
+        ur_count = max(1, len(under))
+        ur_total = sum(g.get("n", 0) for g in under) if under else minority_n
+    else:
+        ur_count, ur_total = 1, minority_n
+    return {
+        "minority_n": minority_n,
+        "majority_n": majority_n,
+        "underrepresented_group_count": ur_count,
+        "underrepresented_total_n": ur_total,
+        "severity": fp.get("severity"),
+    }
+
+
+def _proxy_substitutability_from_stage5(stage5: dict) -> float | None:
+    """Read the proxy-substitutability score Stage 5 published. Returns None
+    when Stage 5 didn't run or no proxy was found (e.g. cause isn't proxy)."""
+    if not stage5:
+        return None
+    results = stage5.get("results") or {}
+    # Pick the protected attribute that produced a substitutability number
+    # (matches Stage 5's own ordering).
+    for _attr, payload in results.items():
+        sub = payload.get("proxy_substitutability") if isinstance(payload, dict) else None
+        if sub is not None:
+            try:
+                return float(sub)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def _data_remediation_plan(
     cp3: "CP3RootCause",
     cp4: "CP4FinalRecommendation",
+    cp1: "CP1BiasValidation",
     stage1: dict,
+    stage5: dict | None = None,
+    labels_auditable: bool | None = None,
 ) -> "DataRemediation":
     """Generate dataset-level remediation when CP4 has blocked every candidate.
 
-    Returns triggered=False otherwise so Stage 8 can short-circuit display.
-    The headline string is fixed by design ("No safe model exists under
-    current data conditions") so downstream consumers can render it verbatim.
+    `triggered` flips True only on the no-recommendation path. `strategy` is
+    always populated so Stage 8 can show 'what to do with the data' even when
+    a model is technically recommended but the deployment checklist is failing.
     """
+    strat_inputs = _strategy_inputs_from_stage1(stage1)
+    proxy_sub = _proxy_substitutability_from_stage5(stage5 or {})
+
+    # Use cp1's severity (already normalized) as the authoritative severity.
+    severity = cp1.severity if cp1 else strat_inputs.get("severity")
+
+    cause_for_strat = cp3.statistical_root_cause or "unknown"
+    strategy = _classify_data_strategy(
+        cause_for_strat,
+        strat_inputs["minority_n"],
+        strat_inputs["majority_n"],
+        severity=severity,
+        underrepresented_group_count=strat_inputs["underrepresented_group_count"],
+        underrepresented_total_n=strat_inputs["underrepresented_total_n"],
+        proxy_substitutability=proxy_sub,
+        labels_auditable=labels_auditable,
+        diagnosis_disagreed=cp3.disagreement_flag,
+    )
+
     if cp4.pareto_status != "no_recommendation":
         return DataRemediation(
             triggered=False,
             root_cause=cp3.statistical_root_cause,
+            strategy=strategy,
         )
 
     # Pull minority/majority from Stage 1 fingerprint to make recommendations specific.
@@ -3265,12 +3709,27 @@ def _data_remediation_plan(
             "Manual diagnosis must precede any intervention — model-level or data-level."
         )
 
+    # Re-classify with the FINAL cause (may differ from CP3 statistical when
+    # the disagreement-priority bumped us to a more invasive cause).
+    strategy = _classify_data_strategy(
+        cause,
+        strat_inputs["minority_n"],
+        strat_inputs["majority_n"],
+        severity=severity,
+        underrepresented_group_count=strat_inputs["underrepresented_group_count"],
+        underrepresented_total_n=strat_inputs["underrepresented_total_n"],
+        proxy_substitutability=proxy_sub,
+        labels_auditable=labels_auditable,
+        diagnosis_disagreed=cp3.disagreement_flag,
+    )
+
     return DataRemediation(
         triggered=True,
         headline=headline,
         root_cause=cause,
         rationale=rationale,
         actions=actions,
+        strategy=strategy,
     )
 
 
@@ -3434,11 +3893,19 @@ def stage_7():
     s4 = payload.get("stage4") or {}
     s5 = payload.get("stage5") or {}
 
+    # Read labels_auditable from the session (set by the user on Configure).
+    # None = unknown / not specified, which the strategy classifier treats
+    # conservatively (defaults to "both" for label_bias).
+    sess = _get_session(session_id) or {}
+    labels_auditable = sess.get("labels_auditable")
+
     cp1 = _cp1_bias_validation(s1)
     cp2 = _cp2_model_hypotheses(s2, s3)
     cp3 = _cp3_root_cause(s1, s3, s5)
     cp4 = _cp4_final_gate(s4)
-    data_remediation = _data_remediation_plan(cp3, cp4, s1)
+    data_remediation = _data_remediation_plan(
+        cp3, cp4, cp1, s1, stage5=s5, labels_auditable=labels_auditable
+    )
 
     all_passed = (
         cp1.severity != "high"
@@ -3735,12 +4202,35 @@ def _stage8_deployment(stage7: dict) -> dict:
             "fairness or non-dominance gate is not satisfied."
         )
 
+    # When the verdict is anything other than 'deploy', the data is almost
+    # always the primary issue — surface the strategy classification so the
+    # user knows whether cleaning suffices or new collection is required.
+    dr = stage7.get("data_remediation") or {}
+    strategy = dr.get("strategy")
+    is_primary_data_issue = (
+        verdict != "deploy"
+        and (cp4.get("pareto_status") == "no_recommendation" or passed_count <= 2)
+    )
+    data_intervention = None
+    if verdict != "deploy" and strategy:
+        data_intervention = {
+            "kind": strategy.get("kind"),
+            "headline": strategy.get("headline"),
+            "rationale": strategy.get("rationale"),
+            "can_cleaning_alone_fix": strategy.get("can_cleaning_alone_fix"),
+            "requires_new_collection": strategy.get("requires_new_collection"),
+            "is_primary_issue": is_primary_data_issue,
+            "confidence": strategy.get("confidence"),
+            "signals": strategy.get("signals") or [],
+        }
+
     return {
         "verdict": verdict,
         "verdict_text": verdict_text,
         "passed_count": passed_count,
         "total_conditions": len(conditions),
         "conditions": conditions,
+        "data_intervention": data_intervention,
     }
 
 

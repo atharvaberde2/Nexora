@@ -9,6 +9,9 @@ export type AuditConfig = {
   target: string;
   positiveClass: string;
   protectedAttrs: string[];
+  /** Tri-state user input: are the original labeling criteria documented +
+   *  auditable? Drives Stage 7's label_bias data strategy. `null` = unsure. */
+  labelsAuditable: boolean | null;
 };
 
 const MAX_PROTECTED_ATTRS = 4;
@@ -45,6 +48,9 @@ export function ConfigureStage({
     suggestedProtected ? [suggestedProtected] : []
   );
   const [positiveClass, setPositiveClass] = useState<string>("");
+  // null = unsure (default; conservative). The Stage 7 label-bias branch
+  // uses this only when the diagnosed cause is label_bias.
+  const [labelsAuditable, setLabelsAuditable] = useState<boolean | null>(null);
 
   const targetCol = csv.columns.find((c) => c.name === target);
   const protectedCols = useMemo(
@@ -256,6 +262,43 @@ export function ConfigureStage({
             </Card>
           )}
 
+          <Card className="p-4 space-y-3">
+            <div>
+              <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-1">
+                Are the original labeling criteria documented and auditable?
+              </div>
+              <p className="text-xs text-ink-muted leading-relaxed">
+                Optional. Used only if the audit detects label bias — tells us
+                whether existing labels can be cleaned in place or whether
+                fresh labels are required.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { v: null, label: "Unsure" },
+                { v: true, label: "Yes — auditable" },
+                { v: false, label: "No — opaque" },
+              ].map((opt) => {
+                const active = labelsAuditable === opt.v;
+                return (
+                  <button
+                    key={String(opt.v)}
+                    type="button"
+                    onClick={() => setLabelsAuditable(opt.v as boolean | null)}
+                    className={cn(
+                      "px-3 py-1.5 rounded-md border text-xs font-medium transition-colors",
+                      active
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-hairline text-ink-muted hover:text-ink hover:border-ink-dim"
+                    )}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </Card>
+
           {warnings.length > 0 && (
             <div className="text-xs text-ink-muted space-y-1">
               {warnings.map((w) => (
@@ -280,6 +323,7 @@ export function ConfigureStage({
                   target,
                   protectedAttrs,
                   positiveClass,
+                  labelsAuditable,
                 })
               }
             >

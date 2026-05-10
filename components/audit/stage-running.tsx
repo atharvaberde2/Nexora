@@ -32,6 +32,7 @@ import {
   type Stage8Response,
   type Stage8DeploymentCondition,
   type DataRemediationAction,
+  type DataStrategy,
 } from "@/lib/api";
 import type { ParsedCsv } from "@/lib/csv";
 import type { AuditConfig } from "./stage-configure";
@@ -2839,6 +2840,13 @@ function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: A
             protected attribute. Ratio = how many times more important the feature
             is for one group vs. the other.
           </div>
+          {firstAttr.proxy_substitutability !== null &&
+            firstAttr.proxy_substitutability !== undefined && (
+              <SubstitutabilityStrip
+                value={firstAttr.proxy_substitutability}
+                topProxy={firstAttr.proxy_features[0]?.feature ?? "?"}
+              />
+            )}
           <ProxyFeaturesPanel
             proxyFeatures={firstAttr.proxy_features}
             groupShap={firstAttr.group_shap}
@@ -2946,6 +2954,65 @@ function GroupContextPanel({
     </div>
   );
 }
+
+/** Substitutability strip for Stage 5. Shows how much of the MAJORITY group's
+ *  predictive signal the top proxy feature carries — drives whether removing
+ *  the proxy is "free" (pure proxy, low score) or whether removal would
+ *  degrade overall AUC (substantive signal, high score → escalate later). */
+function SubstitutabilityStrip({
+  value,
+  topProxy,
+}: {
+  value: number;
+  topProxy: string;
+}) {
+  const pct = value * 100;
+  const tone =
+    value >= 0.4 ? "danger" : value <= 0.1 ? "success" : "warning";
+  const interpretation =
+    value >= 0.4
+      ? "Top proxy carries substantial majority-group signal — removing it would degrade overall AUC. Stage 7 will escalate to manual review."
+      : value <= 0.1
+      ? "Top proxy is asymmetric across groups (high importance for the minority, low for the majority). Cheap to remove — Stage 7 will recommend cleaning."
+      : "Top proxy carries moderate majority-group signal. Cleaning is plausible but trade-offs exist.";
+  return (
+    <div
+      className={cn(
+        "rounded-md border px-4 py-3",
+        tone === "danger"
+          ? "border-danger/30 bg-danger/[0.06]"
+          : tone === "success"
+          ? "border-success/25 bg-success/[0.05]"
+          : "border-warning/30 bg-warning/[0.05]"
+      )}
+    >
+      <div className="flex items-baseline justify-between gap-3 mb-1.5">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+          Proxy substitutability
+        </div>
+        <div
+          className={cn(
+            "font-mono text-sm tabular",
+            tone === "danger"
+              ? "text-danger"
+              : tone === "success"
+              ? "text-success"
+              : "text-warning"
+          )}
+        >
+          {pct.toFixed(1)}%
+        </div>
+      </div>
+      <div className="text-xs text-ink-muted leading-relaxed">
+        Top proxy{" "}
+        <span className="font-mono text-ink">{topProxy}</span> contributes{" "}
+        <span className="font-mono text-ink">{pct.toFixed(1)}%</span> of the
+        majority group's total SHAP importance. {interpretation}
+      </div>
+    </div>
+  );
+}
+
 
 function ProxyFeaturesPanel({
   proxyFeatures,
@@ -3470,7 +3537,85 @@ function ReasoningCheckpointsArtifact({ response }: { response: Stage7Response }
           }
         />
       </div>
+
+      {/* Stage 7's data strategy verdict — a preview of what Stage 8 will
+          surface in its deployment tab. Always present (even on the
+          deploy-happy path) so reviewers can see the verdict before the
+          report is generated. */}
+      {response.data_remediation?.strategy && (
+        <DataStrategyPreview strategy={response.data_remediation.strategy} />
+      )}
     </div>
+  );
+}
+
+/** Stage 7 preview of the DataStrategy verdict — kind, headline, rationale,
+ *  confidence, and the evidence rules that fired. The same data ships in the
+ *  Stage 8 deployment tab; this just lets users see it one stage earlier. */
+function DataStrategyPreview({ strategy }: { strategy: DataStrategy }) {
+  const KIND_LABEL: Record<DataStrategy["kind"], string> = {
+    clean: "Clean existing data",
+    collect: "Collect new data",
+    both: "Clean + collect",
+    manual_review: "Manual review",
+  };
+  const KIND_TONE: Record<DataStrategy["kind"], "accent" | "warning" | "danger" | "neutral"> = {
+    clean: "accent",
+    collect: "warning",
+    both: "warning",
+    manual_review: "neutral",
+  };
+  const confTone =
+    strategy.confidence >= 0.7
+      ? "text-success"
+      : strategy.confidence >= 0.5
+      ? "text-warning"
+      : "text-danger";
+  return (
+    <Card className="p-5 border-warning/25">
+      <div className="flex items-baseline justify-between mb-3">
+        <div>
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-0.5">
+            Data strategy verdict (preview · driven by CP1–CP4 + Stage 5)
+          </div>
+          <div className="font-serif text-base text-ink leading-tight">
+            {strategy.headline}
+          </div>
+        </div>
+        <Badge tone={KIND_TONE[strategy.kind]} dot>
+          {KIND_LABEL[strategy.kind]}
+        </Badge>
+      </div>
+      <p className="text-xs text-ink-muted leading-relaxed mb-3">
+        {strategy.rationale}
+      </p>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-2xs font-mono uppercase tracking-wider mb-3">
+        <span className={strategy.can_cleaning_alone_fix ? "text-success" : "text-ink-dim"}>
+          cleaning alone {strategy.can_cleaning_alone_fix ? "fixes it" : "is not enough"}
+        </span>
+        <span className={strategy.requires_new_collection ? "text-warning" : "text-ink-dim"}>
+          new collection {strategy.requires_new_collection ? "required" : "not required"}
+        </span>
+        <span className={confTone}>
+          confidence {(strategy.confidence * 100).toFixed(0)}%
+        </span>
+      </div>
+      {strategy.signals.length > 0 && (
+        <details className="text-xs text-ink-muted">
+          <summary className="text-2xs uppercase tracking-[0.16em] text-ink-dim cursor-pointer hover:text-ink">
+            Evidence ({strategy.signals.length})
+          </summary>
+          <ul className="mt-2 space-y-1">
+            {strategy.signals.map((s, i) => (
+              <li key={i} className="flex items-start gap-2 leading-snug">
+                <span className="text-ink-dim font-mono mt-0.5 shrink-0">·</span>
+                <span>{s}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </Card>
   );
 }
 
@@ -4048,7 +4193,108 @@ function DeploymentTab({ data }: { data: Stage8Response["deployment"] }) {
           ))}
         </div>
       </Card>
+
+      {data.data_intervention && (
+        <DataInterventionCard intervention={data.data_intervention} />
+      )}
     </div>
+  );
+}
+
+/** Renders Stage 8's "what to do with your data" panel. Only shown when the
+ *  verdict is not "deploy". Tells the user whether cleaning fixes it, new
+ *  collection is required, both, or escalation is needed — and whether the
+ *  data is the *primary* issue (CP4 failed or ≤2/4 conditions met). */
+function DataInterventionCard({
+  intervention,
+}: {
+  intervention: NonNullable<Stage8Response["deployment"]["data_intervention"]>;
+}) {
+  const KIND_LABEL: Record<typeof intervention.kind, string> = {
+    clean: "Clean existing data",
+    collect: "Collect new data",
+    both: "Clean + collect",
+    manual_review: "Escalate to manual review",
+  };
+  const KIND_TONE: Record<typeof intervention.kind, "accent" | "warning" | "danger" | "neutral"> = {
+    clean: "accent",
+    collect: "warning",
+    both: "warning",
+    manual_review: "neutral",
+  };
+  return (
+    <Card className="p-5 border-warning/25">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+          What to do with the data
+        </div>
+        <div className="flex items-center gap-2">
+          {intervention.is_primary_issue && (
+            <Badge tone="danger" dot>Primary issue</Badge>
+          )}
+          <Badge tone={KIND_TONE[intervention.kind]} dot>
+            {KIND_LABEL[intervention.kind]}
+          </Badge>
+        </div>
+      </div>
+      <div className="font-serif text-base text-ink mb-2 leading-tight">
+        {intervention.headline}
+      </div>
+      <p className="text-sm text-ink-muted leading-relaxed mb-4">
+        {intervention.rationale}
+      </p>
+      <div className="grid grid-cols-3 gap-3 text-xs">
+        <div className="rounded-md border border-hairline bg-elevated/40 px-3 py-2.5">
+          <div className="text-2xs uppercase tracking-[0.16em] text-ink-dim mb-1">
+            Cleaning alone fixes it
+          </div>
+          <div className={cn(
+            "font-mono",
+            intervention.can_cleaning_alone_fix ? "text-success" : "text-warning"
+          )}>
+            {intervention.can_cleaning_alone_fix ? "yes" : "no"}
+          </div>
+        </div>
+        <div className="rounded-md border border-hairline bg-elevated/40 px-3 py-2.5">
+          <div className="text-2xs uppercase tracking-[0.16em] text-ink-dim mb-1">
+            Need new data collection
+          </div>
+          <div className={cn(
+            "font-mono",
+            intervention.requires_new_collection ? "text-warning" : "text-success"
+          )}>
+            {intervention.requires_new_collection ? "yes" : "no"}
+          </div>
+        </div>
+        <div className="rounded-md border border-hairline bg-elevated/40 px-3 py-2.5">
+          <div className="text-2xs uppercase tracking-[0.16em] text-ink-dim mb-1">
+            Confidence
+          </div>
+          <div className={cn(
+            "font-mono",
+            intervention.confidence >= 0.7 ? "text-success"
+              : intervention.confidence >= 0.5 ? "text-warning" : "text-danger"
+          )}>
+            {(intervention.confidence * 100).toFixed(0)}%
+          </div>
+        </div>
+      </div>
+      {intervention.signals.length > 0 && (
+        <div className="mt-4 pt-4 border-t border-hairline">
+          <div className="text-2xs uppercase tracking-[0.16em] text-ink-dim mb-2">
+            Evidence rules fired
+          </div>
+          <ul className="space-y-1 text-xs text-ink-muted">
+            {intervention.signals.map((s, i) => (
+              <li key={i} className="flex items-start gap-2 leading-snug">
+                <span className="text-ink-dim font-mono mt-0.5 shrink-0">·</span>
+                <span>{s}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Card>
   );
 }
 
