@@ -175,10 +175,17 @@ const PIPELINE: StageDef[] = [
       const lines = r.results.map((x) => {
         const total = x.models.length;
         const optimal = x.models.filter((m) => m.pareto_optimal).length;
+        const disqualified = x.models.filter(
+          (m) => m.pareto_optimal && !m.fairness_qualified
+        ).length;
         const rec = x.models.find((m) => m.recommended);
-        return `${x.protected}: ${optimal}/${total} on frontier${rec ? ` · rec ${rec.name}` : ""}`;
+        return (
+          `${x.protected}: ${optimal}/${total} on frontier` +
+          (disqualified > 0 ? ` · ${disqualified} disqualified by fairness` : "") +
+          (rec ? ` · rec ${rec.name}` : " · no recommendation")
+        );
       });
-      return lines.join(" · ");
+      return `EO threshold ${(r.eo_gap_threshold * 100).toFixed(0)}pp · ${lines.join(" · ")}`;
     },
   },
   {
@@ -2033,7 +2040,13 @@ function ParetoTradeoffPanel({
   );
 }
 
-function ParetoPanel({ attr }: { attr: Stage4Response["results"][number] }) {
+function ParetoPanel({
+  attr,
+  eoThreshold,
+}: {
+  attr: Stage4Response["results"][number];
+  eoThreshold: number;
+}) {
   const valid = attr.models.filter(
     (m): m is Stage4Model & { auc: number; fairness_gap: number } =>
       m.auc != null && m.fairness_gap != null
@@ -2054,7 +2067,7 @@ function ParetoPanel({ attr }: { attr: Stage4Response["results"][number] }) {
   return (
     <div className="grid lg:grid-cols-5 gap-4">
       <div className="lg:col-span-3 rounded-md border border-hairline bg-canvas/60 p-3 sm:p-5">
-        <ParetoSvg models={valid} />
+        <ParetoSvg models={valid} eoThreshold={eoThreshold} />
       </div>
       <div className="lg:col-span-2 rounded-md border border-hairline overflow-hidden">
         <table className="w-full text-sm tabular">
@@ -2104,13 +2117,19 @@ function ParetoPanel({ attr }: { attr: Stage4Response["results"][number] }) {
                   </td>
                   <td className="py-2.5 px-2 pr-4 text-right">
                     {m.recommended ? (
-                      <span title="Best accuracy among models that aren't strictly worse than any other in either accuracy or fairness — the system's pick.">
+                      <span title="Highest AUC among models that are Pareto-optimal AND satisfy the fairness threshold. The system's pick.">
                         <Badge tone="success" dot>
                           Recommended
                         </Badge>
                       </span>
+                    ) : m.pareto_optimal && !m.fairness_qualified ? (
+                      <span title="Pareto-optimal but disqualified from being recommended because its EO gap exceeds the fairness threshold. Fairness is enforced as a constraint, not a tiebreaker.">
+                        <Badge tone="warning" className="border-dashed">
+                          Disqualified
+                        </Badge>
+                      </span>
                     ) : m.pareto_optimal ? (
-                      <span title="Pareto-optimal: no other model is at least as accurate AND at least as fair. A viable alternative if you want a different accuracy/fairness tradeoff than the recommended pick.">
+                      <span title="Pareto-optimal and within the fairness threshold — a viable alternative if you want a different accuracy/fairness tradeoff than the recommended pick.">
                         <Badge tone="warning">Pareto</Badge>
                       </span>
                     ) : (
@@ -2133,8 +2152,10 @@ function ParetoPanel({ attr }: { attr: Stage4Response["results"][number] }) {
 
 function ParetoSvg({
   models,
+  eoThreshold,
 }: {
   models: (Stage4Model & { auc: number; fairness_gap: number })[];
+  eoThreshold: number;
 }) {
   const W = 480;
   const H = 320;
@@ -2142,11 +2163,12 @@ function ParetoSvg({
 
   const aucs = models.map((m) => m.auc);
   const gaps = models.map((m) => m.fairness_gap);
-  // Domain with slack so points don't sit on the axis.
+  // Domain with slack so points don't sit on the axis. Always include the
+  // threshold so the user can see whether models cluster above or below it.
   const xMin = Math.max(0, Math.min(...aucs) - 0.02);
   const xMax = Math.min(1, Math.max(...aucs) + 0.02);
   const yMin = 0;
-  const yMax = Math.max(...gaps, 0.05) * 1.15;
+  const yMax = Math.max(...gaps, eoThreshold * 1.2, 0.05) * 1.15;
 
   const xScale = (v: number) =>
     PAD.left + ((v - xMin) / Math.max(xMax - xMin, 1e-6)) * (W - PAD.left - PAD.right);
@@ -2244,6 +2266,40 @@ function ParetoSvg({
         Equalized-odds gap ↓
       </text>
 
+      {/* Fairness threshold band — shades the disqualified region above the
+          guardrail and draws a dashed line at the threshold value. */}
+      {eoThreshold <= yMax && (
+        <>
+          <rect
+            x={PAD.left}
+            y={PAD.top}
+            width={W - PAD.left - PAD.right}
+            height={Math.max(0, yScale(eoThreshold) - PAD.top)}
+            fill="#FBBF24"
+            opacity={0.07}
+          />
+          <line
+            x1={PAD.left}
+            x2={W - PAD.right}
+            y1={yScale(eoThreshold)}
+            y2={yScale(eoThreshold)}
+            stroke="#FBBF24"
+            strokeWidth={1.2}
+            strokeDasharray="3 3"
+            opacity={0.7}
+          />
+          <text
+            x={W - PAD.right - 4}
+            y={yScale(eoThreshold) - 4}
+            textAnchor="end"
+            className="fill-warning font-mono"
+            fontSize={9}
+          >
+            fairness threshold {(eoThreshold * 100).toFixed(0)}pp
+          </text>
+        </>
+      )}
+
       {/* frontier polyline */}
       {frontierPath && (
         <path
@@ -2256,17 +2312,20 @@ function ParetoSvg({
         />
       )}
 
-      {/* points — outer halo color matches the verdict (green/yellow/red) so
-          the chart visually matches the table; inner fill stays the model color */}
+      {/* points — outer halo color matches the verdict so the chart visually
+          matches the table; inner fill stays the model color */}
       {models.map((m) => {
         const color = MODEL_COLOR[m.color] ?? MODEL_COLOR.m1;
         const cx = xScale(m.auc);
         const cy = yScale(m.fairness_gap);
         const isRec = m.recommended;
         const isPareto = m.pareto_optimal;
+        const isDisqualified = isPareto && !m.fairness_qualified;
         // Verdict ring color (CSS-named so it picks up theme tokens).
         const ringColor = isRec
           ? "#34D399"   // success / green
+          : isDisqualified
+          ? "#FB923C"   // orange — Pareto but over fairness threshold
           : isPareto
           ? "#FBBF24"   // warning / yellow
           : "#F87171";  // danger / red
@@ -2279,9 +2338,10 @@ function ParetoSvg({
               cx={cx}
               cy={cy}
               r={isRec ? 6 : isPareto ? 5 : 4}
-              fill={isRec || isPareto ? color : "transparent"}
+              fill={isRec || (isPareto && !isDisqualified) ? color : "transparent"}
               stroke={ringColor}
               strokeWidth={2}
+              strokeDasharray={isDisqualified ? "3 2" : undefined}
               opacity={isPareto || isRec ? 1 : 0.65}
             />
             <text
@@ -2296,14 +2356,24 @@ function ParetoSvg({
           </g>
         );
       })}
-      {/* Verdict legend */}
+      {/* Verdict legend — four-state to match the table */}
       <g transform={`translate(${PAD.left + 6} ${PAD.top + 6})`}>
         <circle cx={0} cy={4} r={4} fill="transparent" stroke="#34D399" strokeWidth={2} />
         <text x={9} y={7} fontSize={9} className="fill-ink-dim font-mono">Recommended</text>
         <circle cx={92} cy={4} r={4} fill="transparent" stroke="#FBBF24" strokeWidth={2} />
         <text x={101} y={7} fontSize={9} className="fill-ink-dim font-mono">Pareto</text>
-        <circle cx={148} cy={4} r={4} fill="transparent" stroke="#F87171" strokeWidth={2} />
-        <text x={157} y={7} fontSize={9} className="fill-ink-dim font-mono">Dominated</text>
+        <circle
+          cx={148}
+          cy={4}
+          r={4}
+          fill="transparent"
+          stroke="#FB923C"
+          strokeWidth={2}
+          strokeDasharray="3 2"
+        />
+        <text x={157} y={7} fontSize={9} className="fill-ink-dim font-mono">Disqualified</text>
+        <circle cx={236} cy={4} r={4} fill="transparent" stroke="#F87171" strokeWidth={2} />
+        <text x={245} y={7} fontSize={9} className="fill-ink-dim font-mono">Dominated</text>
       </g>
     </svg>
   );
