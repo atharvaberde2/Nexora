@@ -677,12 +677,29 @@ export type Stage7Narratives = {
   llm_model: string | null;
 };
 
+export type DataRemediationAction = {
+  id: string;
+  title: string;
+  body: string;
+  why_model_fix_insufficient: string;
+  success_criteria: string[];
+};
+
+export type DataRemediation = {
+  triggered: boolean;
+  headline: string;
+  root_cause: string;
+  rationale: string;
+  actions: DataRemediationAction[];
+};
+
 export type Stage7Response = {
   session_id: string;
   bias_validation: CP1BiasValidation;
   model_hypotheses: CP2ModelHypotheses;
   root_cause_consistency: CP3RootCause;
   final_recommendation: CP4FinalRecommendation;
+  data_remediation: DataRemediation;
   all_checkpoints_passed: boolean;
   checkpoints_summary: string;
   narratives: Stage7Narratives;
@@ -717,8 +734,12 @@ export type Stage8Executive = {
   auc: number | null;
   eo_gap: number | null;
   status: string;
+  /** Set when no model passes CP4 — verbatim "No safe model exists under current data conditions". */
+  headline?: string | null;
   reason: string;
   business_interpretation: string;
+  /** Populated when no model passes CP4; null on the happy deploy path. */
+  data_remediation?: DataRemediation | null;
 };
 
 export type Stage8DisadvantagedGroup = {
@@ -756,11 +777,16 @@ export type Stage8ModelBehavior = {
 };
 
 export type Stage8Actions = {
+  /** "model_remediation" on the happy path; "data_remediation" when CP4 blocked all candidates. */
+  mode?: "model_remediation" | "data_remediation";
   diagnosis: string | null;
   summary: string | null;
+  /** Set in data_remediation mode — verbatim headline. */
+  headline?: string | null;
   safe_to_auto_fix: boolean;
   warning: string | null;
-  actions: Stage6Action[];
+  /** Stage 6 model-level actions, OR Stage 7 data-level actions when mode == "data_remediation". */
+  actions: (Stage6Action | DataRemediationAction)[];
   blocked_count: number;
   recommended_count: number;
   verified_by_stage7: boolean;

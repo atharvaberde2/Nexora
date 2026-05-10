@@ -5,7 +5,7 @@ import { Nav } from "@/components/nav";
 import { StageRail, type RailStage } from "@/components/audit/stage-rail";
 import { UploadStage } from "@/components/audit/stage-upload";
 import { ConfigureStage, type AuditConfig } from "@/components/audit/stage-configure";
-import { RunningStage } from "@/components/audit/stage-running";
+import { RunningStage, type StageData } from "@/components/audit/stage-running";
 import { ResultsStage } from "@/components/audit/stage-results";
 import type { ParsedCsv } from "@/lib/csv";
 
@@ -14,6 +14,7 @@ export default function AuditPage() {
   const [csv, setCsv] = useState<ParsedCsv | null>(null);
   const [cfg, setCfg] = useState<AuditConfig | null>(null);
   const [elapsedSec, setElapsedSec] = useState("0.0");
+  const [finalData, setFinalData] = useState<StageData>({});
 
   const navContext = csv
     ? {
@@ -69,8 +70,9 @@ export default function AuditPage() {
           <RunningStage
             csv={csv}
             cfg={cfg}
-            onComplete={(totalSec) => {
+            onComplete={(totalSec, data) => {
               setElapsedSec(totalSec.toFixed(1));
+              setFinalData(data);
               setStage("results");
             }}
           />
@@ -81,10 +83,13 @@ export default function AuditPage() {
             csv={csv}
             cfg={cfg}
             elapsedSec={elapsedSec}
+            stage7={finalData.stage7}
+            stage8={finalData.stage8}
             onRestart={() => {
               setCsv(null);
               setCfg(null);
               setElapsedSec("0.0");
+              setFinalData({});
               setStage("upload");
             }}
           />

@@ -31,6 +31,7 @@ import {
   type CP2PerModel,
   type Stage8Response,
   type Stage8DeploymentCondition,
+  type DataRemediationAction,
 } from "@/lib/api";
 import type { ParsedCsv } from "@/lib/csv";
 import type { AuditConfig } from "./stage-configure";
@@ -79,7 +80,7 @@ type Stage3Live = {
   complete: boolean;
 };
 
-type StageData = {
+export type StageData = {
   stage1?: Stage1Response;
   stage2?: Stage2Live;
   stage3?: Stage3Live;
@@ -267,7 +268,7 @@ export function RunningStage({
 }: {
   csv: ParsedCsv;
   cfg: AuditConfig;
-  onComplete: (totalRunningSec: number) => void;
+  onComplete: (totalRunningSec: number, finalData: StageData) => void;
 }) {
   const [currentIdx, setCurrentIdx] = useState(0);
   const [status, setStatus] = useState<StageStatus>("idle");
@@ -589,7 +590,7 @@ export function RunningStage({
 
   function advance() {
     if (isLast) {
-      onComplete(totalRunningMsRef.current / 1000);
+      onComplete(totalRunningMsRef.current / 1000, data);
       return;
     }
     const nextIdx = currentIdx + 1;
@@ -3961,14 +3962,18 @@ function ModelBehaviorTab({ data }: { data: Stage8Response["model_behavior"] }) 
 }
 
 function ActionsTab({ data }: { data: Stage8Response["actions"] }) {
+  const isDataMode = data.mode === "data_remediation";
   return (
     <div className="space-y-4">
       {data.diagnosis && (
         <Card className="p-5 space-y-2">
           <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
-            Diagnosis
+            {isDataMode ? "Dataset diagnosis" : "Diagnosis"}
           </div>
           <div className="font-serif text-lg text-ink">{data.diagnosis}</div>
+          {data.headline && (
+            <div className="text-sm text-danger font-medium">{data.headline}.</div>
+          )}
           {data.summary && (
             <p className="text-sm text-ink-muted leading-relaxed">{data.summary}</p>
           )}
@@ -3991,11 +3996,65 @@ function ActionsTab({ data }: { data: Stage8Response["actions"] }) {
       )}
 
       <div className="grid lg:grid-cols-3 gap-4">
-        {data.actions.map((a) => (
-          <RemediationCard key={a.id} action={a} />
-        ))}
+        {data.actions.map((a) =>
+          isDataLevelAction(a) ? (
+            <DataActionCard key={a.id} action={a} />
+          ) : (
+            <RemediationCard key={a.id} action={a} />
+          )
+        )}
       </div>
     </div>
+  );
+}
+
+/** Type guard separating Stage 6 model-level actions (have `status`) from
+ *  Stage 7 data-level actions (have `why_model_fix_insufficient`). */
+function isDataLevelAction(
+  a: Stage6Action | DataRemediationAction
+): a is DataRemediationAction {
+  return (a as DataRemediationAction).why_model_fix_insufficient !== undefined;
+}
+
+function DataActionCard({ action }: { action: DataRemediationAction }) {
+  const hasCriteria = action.success_criteria && action.success_criteria.length > 0;
+  return (
+    <Card className="p-5 border-warning/25">
+      <div className="flex items-center justify-between mb-3">
+        <Badge tone="accent" dot>Apply at data layer</Badge>
+        <span className="text-2xs text-ink-dim font-mono uppercase tracking-wider">
+          Stage 7
+        </span>
+      </div>
+      <div className="font-serif text-base text-ink mb-2">{action.title}</div>
+      <p className="text-sm text-ink-muted leading-relaxed">{action.body}</p>
+      <div className="mt-3 pt-3 border-t border-hairline">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-1.5">
+          Why a model-level fix isn&apos;t enough
+        </div>
+        <p className="text-xs text-ink-muted leading-snug">
+          {action.why_model_fix_insufficient}
+        </p>
+      </div>
+      {hasCriteria && (
+        <div className="mt-3 pt-3 border-t border-hairline">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-1.5">
+            Accept this fix only if
+          </div>
+          <ul className="space-y-1">
+            {action.success_criteria.map((c, i) => (
+              <li
+                key={i}
+                className="flex items-start gap-2 text-xs text-ink-muted leading-snug"
+              >
+                <span className="text-success font-mono mt-0.5">✓</span>
+                <span>{c}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Card>
   );
 }
 

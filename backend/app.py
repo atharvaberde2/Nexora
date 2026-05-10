@@ -2600,6 +2600,28 @@ class CP4FinalRecommendation(BaseModel):
     auc: float | None = None
 
 
+class DataRemediationAction(BaseModel):
+    """A single data-level fix surfaced when no model passes CP4. Each one
+    must explicitly explain why model-level fixes cannot reach the problem —
+    that's the whole point of this branch."""
+    id: str
+    title: str
+    body: str
+    why_model_fix_insufficient: str
+    success_criteria: list[str] = Field(default_factory=list)
+
+
+class DataRemediation(BaseModel):
+    """Dataset-level remediation surfaced ONLY when CP4.pareto_status is
+    'no_recommendation' — i.e. every candidate model was blocked by Stage 4
+    or Stage 7. Maps Stage 5 / CP3 root cause to data-cleaning steps."""
+    triggered: bool
+    headline: str = ""  # "No safe model exists under current data conditions"
+    root_cause: str = "unknown"
+    rationale: str = ""
+    actions: list[DataRemediationAction] = Field(default_factory=list)
+
+
 class Stage7Narratives(BaseModel):
     """LLM-generated plain-English summaries layered over the deterministic
     checkpoint output. The verdict (pass/fail) is NEVER taken from the LLM —
@@ -2620,6 +2642,7 @@ class Stage7Response(BaseModel):
     model_hypotheses: CP2ModelHypotheses
     root_cause_consistency: CP3RootCause
     final_recommendation: CP4FinalRecommendation
+    data_remediation: DataRemediation
     all_checkpoints_passed: bool
     checkpoints_summary: str
     narratives: Stage7Narratives
@@ -2962,6 +2985,275 @@ def _cp4_final_gate(stage4: dict) -> CP4FinalRecommendation:
     )
 
 
+def _data_remediation_plan(
+    cp3: "CP3RootCause",
+    cp4: "CP4FinalRecommendation",
+    stage1: dict,
+) -> "DataRemediation":
+    """Generate dataset-level remediation when CP4 has blocked every candidate.
+
+    Returns triggered=False otherwise so Stage 8 can short-circuit display.
+    The headline string is fixed by design ("No safe model exists under
+    current data conditions") so downstream consumers can render it verbatim.
+    """
+    if cp4.pareto_status != "no_recommendation":
+        return DataRemediation(
+            triggered=False,
+            root_cause=cp3.statistical_root_cause,
+        )
+
+    # Pull minority/majority from Stage 1 fingerprint to make recommendations specific.
+    s1_results = stage1.get("results") or []
+    primary = (
+        max(s1_results, key=lambda r: len(r.get("fingerprint", {}).get("groups", [])))
+        if s1_results
+        else {"fingerprint": {}, "protected": "the protected attribute"}
+    )
+    fp = primary.get("fingerprint", {}) or {}
+    groups = fp.get("groups") or []
+    sized = sorted(groups, key=lambda g: g.get("n", 0)) if groups else []
+    minority = sized[0] if sized else {}
+    majority = sized[-1] if sized else {}
+    minority_label = minority.get("name") or "the minority group"
+    majority_label = majority.get("name") or "the majority group"
+    minority_n = minority.get("n")
+    majority_n = majority.get("n")
+    attr = primary.get("protected") or "the protected attribute"
+
+    # Pick the cause to act on. If statistical and ML diagnoses disagree, prefer
+    # the more invasive / upstream cause — under-reacting is worse than over-reacting
+    # when the gate has already blocked everything.
+    cause = cp3.statistical_root_cause or "unknown"
+    if cp3.disagreement_flag:
+        priority = {
+            "label_bias": 4,
+            "proxy_discrimination": 3,
+            "representation_bias": 2,
+            "threshold_effect": 1,
+            "unknown": 0,
+        }
+        cause = max(
+            [cp3.statistical_root_cause, cp3.ml_inferred_root_cause],
+            key=lambda c: priority.get(c or "unknown", 0),
+        )
+
+    headline = "No safe model exists under current data conditions"
+
+    if cause == "representation_bias":
+        ratio_text = ""
+        if minority_n and majority_n:
+            ratio_text = f" (currently {majority_n / max(minority_n, 1):.1f}× majority/minority sample ratio)"
+        target_n = int((majority_n or 0) * 0.3) if majority_n else None
+        actions = [
+            DataRemediationAction(
+                id="stratified_resampling",
+                title=f"Stratified resampling for {minority_label}",
+                body=(
+                    f"Apply stratified oversampling (e.g., SMOTE on the training fold only) or "
+                    f"inverse-frequency class weights so {minority_label} "
+                    f"(n = {minority_n if minority_n is not None else 'small'}) contributes to "
+                    f"decision-boundary learning at parity with {majority_label}."
+                ),
+                why_model_fix_insufficient=(
+                    "Every candidate trained on the current sample inherits the same imbalance. "
+                    "Post-hoc threshold tuning, in-processing fairness constraints, and reweighting "
+                    "at inference time cannot synthesize the missing decision-boundary information "
+                    f"from {minority_label} — the signal isn't in the trained weights to recover."
+                ),
+                success_criteria=[
+                    f"Effective sample for {minority_label} reaches ≥ 30% of {majority_label} after weighting",
+                    "EO gap on best-AUC model drops below the configured threshold on retraining",
+                ],
+            ),
+            DataRemediationAction(
+                id="targeted_collection",
+                title=f"Targeted data collection for {minority_label}",
+                body=(
+                    f"Resampling synthesizes new points; it does not add new information. "
+                    f"Collect additional real samples for {minority_label}{ratio_text} until the "
+                    f"observed sample count is comparable to {majority_label}."
+                ),
+                why_model_fix_insufficient=(
+                    f"Subgroup AUC and bootstrap confidence intervals for {minority_label} are unreliable "
+                    "until n increases. No model selected on these unreliable estimates can be safely "
+                    "deployed regardless of training method — the uncertainty is in the data, not the model."
+                ),
+                success_criteria=[
+                    (
+                        f"{minority_label} sample count reaches at least {target_n} (≥ 30% of {majority_label})"
+                        if target_n
+                        else f"{minority_label} sample count grows by ≥ 50% from current"
+                    ),
+                ],
+            ),
+        ]
+        rationale = (
+            f"Group imbalance on {attr} is the primary driver. {minority_label} is too small for any "
+            "model to learn faithful decision boundaries, so every candidate was blocked at CP4. "
+            "Algorithmic interventions (in-processing fairness constraints, post-processing threshold "
+            "tuning, reweighting at inference) cannot manufacture the missing minority-class signal — "
+            "only data-level changes can."
+        )
+
+    elif cause == "label_bias":
+        actions = [
+            DataRemediationAction(
+                id="stratified_label_audit",
+                title=f"Stratified label audit for {attr}",
+                body=(
+                    "Pull a stratified random sample (≥ 50 records per group) of training labels. "
+                    f"Have domain experts re-label independently without access to {attr}. Compare "
+                    "to the original labels and quantify per-group disagreement rate."
+                ),
+                why_model_fix_insufficient=(
+                    "When the labels themselves encode the bias, any model trained on them inherits it. "
+                    "SMOTE, reweighting, in-processing constraints, and threshold tuning all optimize "
+                    "toward the biased target — they reduce the measurable gap while preserving the "
+                    "underlying harm. Fairness metrics improve; outcomes do not."
+                ),
+                success_criteria=[
+                    "≥ 50 labels per group reviewed",
+                    "Inter-rater agreement κ ≥ 0.7 on the audit set",
+                    "Per-group disagreement rate documented",
+                ],
+            ),
+            DataRemediationAction(
+                id="ground_truth_recalibration",
+                title="Recalibrate ground-truth labels",
+                body=(
+                    "Where the audit shows systematic per-group label drift, recalibrate the affected "
+                    "labels (correct, re-label, or remove disputed records) before any retraining round. "
+                    "Document every change with reviewer ID and reason."
+                ),
+                why_model_fix_insufficient=(
+                    "A 'fair' model trained on biased labels is statistical laundering — it produces "
+                    "metrics that pass while the underlying decision pattern remains discriminatory. "
+                    "Only fixing the labels removes the bias from the loss function the model is fitting."
+                ),
+                success_criteria=[
+                    "Audit-trail of every label change preserved",
+                    "Post-recalibration base-rate gap shrinks meaningfully",
+                ],
+            ),
+        ]
+        rationale = (
+            f"Label bias is the diagnosed cause: training labels for {attr} carry historical decision "
+            "patterns the model learned faithfully. No algorithmic intervention is appropriate while the "
+            "target itself is biased — fairness metrics would improve, but the model would still encode "
+            "the original discrimination. The fix is upstream of the model, in the labels."
+        )
+
+    elif cause == "proxy_discrimination":
+        actions = [
+            DataRemediationAction(
+                id="proxy_feature_removal",
+                title=f"Remove or orthogonalize proxy features for {attr}",
+                body=(
+                    f"Identify features statistically correlated with {attr} and remove them from the "
+                    f"feature set, or orthogonalize them (residualize against {attr} on a held-out set). "
+                    "Then re-run the audit on the cleaned feature schema."
+                ),
+                why_model_fix_insufficient=(
+                    "When a proxy feature drives prediction, every model in the candidate set will learn "
+                    "it — the proxy is in the feature space itself, not any one model. Per-group threshold "
+                    "tuning masks the disparity without removing it and can introduce disparate-treatment "
+                    "legal liability."
+                ),
+                success_criteria=[
+                    "Counterfactual flip rate drops below 10% on retraining",
+                    "Proxy SHAP-importance ratio falls below 2.0×",
+                ],
+            ),
+            DataRemediationAction(
+                id="schema_review",
+                title="Domain-expert review of remaining features",
+                body=(
+                    "Have a domain expert review every feature still in the schema for legitimate "
+                    f"predictive value independent of {attr}. Document each retained feature's causal "
+                    "rationale before retraining."
+                ),
+                why_model_fix_insufficient=(
+                    "Proxies are often subtle (zip code → race, occupation → gender). Automated "
+                    "correlation screens catch the obvious ones; domain review catches the ones that "
+                    "matter and that no model selection can fix."
+                ),
+                success_criteria=[
+                    "Each retained feature has a documented causal rationale",
+                    "Removed proxies do not eliminate legitimate predictive signal",
+                ],
+            ),
+        ]
+        rationale = (
+            f"Proxy discrimination is the diagnosed cause: at least one feature is acting as an indirect "
+            f"signal for {attr}. Because the proxy is encoded in the feature space, it is not specific to "
+            "any single model — every candidate inherited it, which is why CP4 blocked them all. The fix "
+            "is to clean the feature schema before retraining, not to tune the model."
+        )
+
+    elif cause == "threshold_effect":
+        # Edge case: threshold effects are normally model-level. If we still got
+        # 'no model safe', the diagnosis is probably masking a deeper cause.
+        actions = [
+            DataRemediationAction(
+                id="manual_review",
+                title="Escalate to manual review",
+                body=(
+                    "The diagnosed cause is threshold-effect, which is normally addressable via per-group "
+                    "threshold optimization at the model level. The fact that CP4 still blocked every "
+                    "candidate suggests an inconsistency upstream — investigate before applying any "
+                    "data-level fix."
+                ),
+                why_model_fix_insufficient=(
+                    "If threshold tuning were sufficient, at least one candidate should have passed CP4. "
+                    "Either the diagnosis is incomplete (a deeper cause is masking as a threshold issue) "
+                    "or the model search space was too narrow. Applying a data-level fix without that "
+                    "diagnosis is premature."
+                ),
+                success_criteria=[
+                    "Stage 5 root-cause confidence re-checked with expanded model search",
+                    "If a deeper cause is confirmed, return to the corresponding remediation path",
+                ],
+            ),
+        ]
+        rationale = (
+            "Threshold effects are normally model-level, so reaching 'no model safe' suggests the "
+            "diagnosis may be incomplete. Manual review is required before applying invasive data changes."
+        )
+
+    else:  # unknown / model_complexity_bias
+        actions = [
+            DataRemediationAction(
+                id="manual_review",
+                title="Escalate to manual review",
+                body=(
+                    "Root cause could not be confidently diagnosed, yet every candidate model failed the "
+                    "fairness gate. Bring in a domain expert to inspect the data fingerprint (Stage 1), "
+                    "feature schema, and labeling process before any retraining or data modification."
+                ),
+                why_model_fix_insufficient=(
+                    "Without a confirmed root cause, model-level fixes are guesses. Guessing on a "
+                    "fairness-blocked dataset risks producing a model that *looks* fair while preserving "
+                    "the underlying harm."
+                ),
+                success_criteria=[
+                    "Confirmed root cause documented before next remediation cycle",
+                ],
+            ),
+        ]
+        rationale = (
+            "Root cause is undetermined, so no data-cleaning recipe is safe to recommend automatically. "
+            "Manual diagnosis must precede any intervention — model-level or data-level."
+        )
+
+    return DataRemediation(
+        triggered=True,
+        headline=headline,
+        root_cause=cause,
+        rationale=rationale,
+        actions=actions,
+    )
+
+
 _S7_SYSTEM_PROMPT = (
     "You are a fairness-auditing reasoning layer. Given the deterministic "
     "checkpoint output of an ML fairness pipeline, write a short plain-English "
@@ -3126,6 +3418,7 @@ def stage_7():
     cp2 = _cp2_model_hypotheses(s2, s3)
     cp3 = _cp3_root_cause(s1, s3, s5)
     cp4 = _cp4_final_gate(s4)
+    data_remediation = _data_remediation_plan(cp3, cp4, s1)
 
     all_passed = (
         cp1.severity != "high"
@@ -3151,6 +3444,7 @@ def stage_7():
             model_hypotheses=cp2,
             root_cause_consistency=cp3,
             final_recommendation=cp4,
+            data_remediation=data_remediation,
             all_checkpoints_passed=all_passed,
             checkpoints_summary=summary,
             narratives=narratives,
@@ -3169,21 +3463,34 @@ def _stage8_executive(stage7: dict) -> dict:
     """TAB 1 — recommended model + business interpretation. Reads from Stage 7's
     CP4 final_recommendation block (which has already verified non-dominance
     and fairness compliance), not directly from Stage 4 — keeping the trust
-    chain Stage 4 → Stage 7 → Stage 8."""
+    chain Stage 4 → Stage 7 → Stage 8.
+
+    When CP4 returns no_recommendation, this tab pivots to the data-remediation
+    headline ("No safe model exists under current data conditions") and surfaces
+    the dataset-level fix list that Stage 7 produced."""
     rec = stage7.get("final_recommendation") or {}
+    dr = stage7.get("data_remediation") or {}
     threshold = rec.get("eo_gap_threshold", EO_GAP_THRESHOLD)
     if not rec.get("model"):
+        # Every candidate was blocked. Lead with the canonical headline and
+        # surface the data-remediation list as the next-action block.
+        headline = dr.get("headline") or "No safe model exists under current data conditions"
+        rationale = dr.get("rationale") or (
+            "No model in this audit cleared both the Pareto-optimality test and "
+            "the fairness-threshold guardrail."
+        )
         return {
             "model": None,
             "auc": None,
             "eo_gap": None,
             "status": "no_recommendation",
+            "headline": headline,
             "reason": rec.get("reason", "No model met the selection criteria."),
             "business_interpretation": (
-                "No model in this audit cleared both the Pareto-optimality test and "
-                "the fairness-threshold guardrail. Deployment is not recommended at "
-                "this time. See the Fairness & Risk tab for the underlying disparity."
+                f"{headline}. {rationale} Deployment is not recommended at this time; "
+                "see the dataset-level remediation steps below before retraining."
             ),
+            "data_remediation": dr if dr.get("triggered") else None,
         }
     return {
         "model": rec["model"],
@@ -3198,6 +3505,7 @@ def _stage8_executive(stage7: dict) -> dict:
             "healthcare). It has been verified by Stage 7 as non-dominated and "
             "fairness-compliant."
         ),
+        "data_remediation": None,
     }
 
 
@@ -3306,12 +3614,40 @@ def _stage8_behavior_narrative(top_features: list, proxy_feats: list, stage5: di
 
 
 def _stage8_actions(stage6: dict, stage7: dict) -> dict:
-    """TAB 4 — actionable recommendations from Stage 6, gated by Stage 7."""
+    """TAB 4 — actionable recommendations.
+
+    When CP4 has recommended a model, surface Stage 6's model-level fix list.
+    When CP4 has blocked every candidate (no_recommendation), pivot to Stage 7's
+    data-level remediation list — the model-level actions are no longer the
+    relevant next step. Whichever list is shown, `mode` tells the consumer."""
     cp4 = stage7.get("final_recommendation") or {}
+    dr = stage7.get("data_remediation") or {}
+    if dr.get("triggered"):
+        # All-blocked path — Stage 6's model-level actions don't apply.
+        data_actions = dr.get("actions") or []
+        return {
+            "mode": "data_remediation",
+            "diagnosis": dr.get("root_cause"),
+            "summary": dr.get("rationale"),
+            "headline": dr.get("headline"),
+            "safe_to_auto_fix": False,
+            "warning": (
+                "No model in this audit is safe to deploy. The actions below operate "
+                "on the dataset, not on any single model — model-level fixes cannot "
+                "reach the diagnosed root cause."
+            ),
+            "actions": data_actions,
+            "blocked_count": 0,
+            "recommended_count": len(data_actions),
+            "verified_by_stage7": False,
+        }
+
     actions = (stage6 or {}).get("actions") or []
     return {
+        "mode": "model_remediation",
         "diagnosis": stage6.get("diagnosis"),
         "summary": stage6.get("summary"),
+        "headline": None,
         "safe_to_auto_fix": stage6.get("safe_to_auto_fix", False),
         "warning": stage6.get("warning"),
         "actions": actions,
@@ -3390,7 +3726,10 @@ _S8_SYSTEM_PROMPT = (
     "(1) Never invent numbers — only use what the JSON gives you. "
     "(2) Never claim the model is fair if 'fairness_compliant' is false. "
     "(3) Never recommend deployment if 'deployment.verdict' is not 'deploy'. "
-    "(4) Be concise: 2–4 sentences per field. No markdown, no headings, plain prose."
+    "(4) If 'executive.data_remediation' is present, every narrative MUST open with the "
+    "exact sentence in 'executive.headline' (no paraphrase) and refer ONLY to dataset-level "
+    "fixes — never recommend a model, never imply one is suitable. "
+    "(5) Be concise: 2–4 sentences per field. No markdown, no headings, plain prose."
 )
 
 
@@ -3403,12 +3742,24 @@ def _stage8_llm_narratives(report: dict) -> dict:
 
     # Slim payload — only the facts needed for narration. Avoids leaking SHAP
     # arrays into the prompt and keeps token usage low.
+    exec_block = report["executive"]
+    dr_summary = None
+    if exec_block.get("data_remediation"):
+        dr = exec_block["data_remediation"]
+        dr_summary = {
+            "headline": dr.get("headline"),
+            "root_cause": dr.get("root_cause"),
+            "rationale": dr.get("rationale"),
+            "action_titles": [a.get("title") for a in (dr.get("actions") or [])],
+        }
     facts = {
         "executive": {
-            "model": report["executive"].get("model"),
-            "auc": report["executive"].get("auc"),
-            "eo_gap": report["executive"].get("eo_gap"),
-            "status": report["executive"].get("status"),
+            "model": exec_block.get("model"),
+            "auc": exec_block.get("auc"),
+            "eo_gap": exec_block.get("eo_gap"),
+            "status": exec_block.get("status"),
+            "headline": exec_block.get("headline"),
+            "data_remediation": dr_summary,
         },
         "fairness_risk": {
             "severity": report["fairness_risk"].get("severity"),
