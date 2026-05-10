@@ -197,6 +197,26 @@ def _safe_float(x) -> float | None:
     return f
 
 
+def _clean_group_label(v) -> str | None:
+    """Normalize a single protected-attribute value to a clean string label,
+    or None if it's missing / NaN / a null sentinel.
+
+    `protected_values` is supposed to come out of prepare_features as strings,
+    but numeric-encoded categorical columns and pandas NaN floats can sneak
+    through (e.g. when an upstream caller bypasses the str conversion). Keep
+    this guard cheap and call it everywhere we iterate over group values."""
+    if v is None:
+        return None
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.lower() in {"nan", "none", "null"}:
+        return None
+    return s
+
+
 # =========================================================
 # Column inspection (Pandas-authoritative types)
 # =========================================================
@@ -1149,7 +1169,7 @@ def _stage3_compute_model_row(
     y_proba = pred["y_proba"]
     for col, values in protected_values.items():
         groups_in_data = sorted(
-            set(v for v in values if v and v.lower() not in {"nan", "none", "null"})
+            {s for v in values if (s := _clean_group_label(v)) is not None}
         )
         by_group: dict[str, dict] = {}
         for i, g in enumerate(groups_in_data):
@@ -1249,7 +1269,7 @@ def stage_3():
     results = []
     for col, values in protected_values.items():
         groups_in_data = sorted(
-            set(v for v in values if v and v.lower() not in {"nan", "none", "null"})
+            {s for v in values if (s := _clean_group_label(v)) is not None}
         )
 
         attr_models = []
@@ -1337,7 +1357,7 @@ def stage_3_stream():
     init_results = []
     for col, values in protected_values.items():
         groups_in_data = sorted(
-            set(v for v in values if v and v.lower() not in {"nan", "none", "null"})
+            {s for v in values if (s := _clean_group_label(v)) is not None}
         )
         init_results.append({
             "protected": col,
@@ -1469,7 +1489,7 @@ def stage_4():
     results = []
     for col, values in protected_values.items():
         groups_in_data = sorted(
-            set(v for v in values if v and v.lower() not in {"nan", "none", "null"})
+            {s for v in values if (s := _clean_group_label(v)) is not None}
         )
 
         rows = []
@@ -2023,7 +2043,7 @@ def stage_5():
     results: dict = {}
     for col, values in protected_values.items():
         groups = sorted(
-            set(v for v in values if v and v.lower() not in {"nan", "none", "null"})
+            {s for v in values if (s := _clean_group_label(v)) is not None}
         )
         if len(groups) < 2:
             continue
