@@ -53,6 +53,15 @@ export type Stage1Group = {
   sufficient_power: boolean;
 };
 
+export type Stage1Preprocessing = {
+  n_input: number;
+  n_audited: number;
+  n_dropped_total: number;
+  n_dropped_target_missing: number;
+  n_dropped_protected_missing: number;
+  drop_rate: number | null;
+};
+
 export type Stage1Fingerprint = {
   n_total: number;
   overall_positive_rate: number | null;
@@ -64,6 +73,8 @@ export type Stage1Fingerprint = {
     significant: boolean;
   };
   top_missing_columns: { name: string; missing_pct: number | null }[];
+  /** Preprocessing transparency — counts of rows dropped before audit. */
+  preprocessing: Stage1Preprocessing;
 };
 
 export type Stage1PerAttr = {
@@ -393,6 +404,10 @@ export type Stage4Model = {
   /** AUC − λ·EO_gap. Higher = better tradeoff. Used as an optional ranking signal
    *  inside the Pareto + fairness-qualified set. */
   composite_score: number | null;
+  /** Set when the model predicts a single class for every input (selection_rate = 0
+   *  or 1 across all groups). Such a model has trivially zero gaps but is decision-
+   *  theoretically useless — it must NOT be recommended even if Pareto-optimal. */
+  degenerate: "all-negative" | "all-positive" | null;
   recommended: boolean;
 };
 
@@ -456,6 +471,15 @@ export type Stage5CorrFeature = {
   group_b: string;
 };
 
+/** Real Bayesian posterior over a single root-cause class — posterior mean
+ *  with 95% credible interval from Monte Carlo over observable uncertainty. */
+export type Stage5BayesClass = {
+  mean: number | null;
+  ci_low: number | null;
+  ci_high: number | null;
+  prior: number | null;
+};
+
 export type Stage5PerAttr = {
   groups: string[];
   /** Sample count per raw group value (e.g., {"0": 312, "1": 45}). */
@@ -474,7 +498,10 @@ export type Stage5PerAttr = {
   eo_gap: number | null;
   dp_gap: number | null;
   base_rate_gap: number | null;
+  /** Posterior means only — kept for backward compatibility. */
   bayesian_root_cause: Record<string, number | null>;
+  /** Full posterior with credible intervals + the prior used for inference. */
+  bayesian_root_cause_full: Record<string, Stage5BayesClass>;
 };
 
 export type Stage5Response = {
@@ -584,6 +611,207 @@ export async function runStage6(
     signal,
   });
   if (!res.ok) throw new Error(await readError(res, "Stage 6"));
+  return res.json();
+}
+
+/* ─────────────  Stage 7 (reasoning checkpoints)  ───────────── */
+
+export type CP1BiasValidation = {
+  n_total: number;
+  n_groups: number;
+  largest_imbalance_ratio: number | null;
+  smallest_group_n: number | null;
+  chi2_significant: boolean;
+  chi2_p_value: number | null;
+  base_rate_gap_pp: number | null;
+  missingness_disparity_pp: number | null;
+  severity: "low" | "medium" | "high";
+  inconsistencies: string[];
+  summary: string;
+};
+
+export type CP2PerModel = {
+  model_key: string;
+  model_name: string;
+  cv_auc: number | null;
+  eo_gap: number | null;
+  subgroup_auc_variance: number | null;
+  verdict: "confirmed" | "rejected" | "ambiguous" | "insufficient_data";
+};
+
+export type CP2ModelHypotheses = {
+  hypothesis: string;
+  correlation_auc_eo: number | null;
+  verdict_summary: "confirmed" | "rejected" | "ambiguous" | "insufficient_data";
+  notes: string[];
+  per_model: CP2PerModel[];
+};
+
+export type CP3RootCause = {
+  statistical_root_cause: string;
+  statistical_evidence: string[];
+  ml_inferred_root_cause: string;
+  agree: boolean;
+  disagreement_flag: boolean;
+  notes: string[];
+};
+
+export type CP4FinalRecommendation = {
+  model: string | null;
+  model_key: string | null;
+  reason: string;
+  pareto_status: "non-dominated" | "no_recommendation";
+  fairness_compliant: boolean;
+  eo_gap: number | null;
+  eo_gap_threshold: number;
+  auc: number | null;
+};
+
+export type Stage7Narratives = {
+  cp1: string;
+  cp2: string;
+  cp3: string;
+  cp4: string;
+  executive_narrative: string;
+  llm_provider: "gemini" | "deterministic";
+  llm_model: string | null;
+};
+
+export type Stage7Response = {
+  session_id: string;
+  bias_validation: CP1BiasValidation;
+  model_hypotheses: CP2ModelHypotheses;
+  root_cause_consistency: CP3RootCause;
+  final_recommendation: CP4FinalRecommendation;
+  all_checkpoints_passed: boolean;
+  checkpoints_summary: string;
+  narratives: Stage7Narratives;
+};
+
+export async function runStage7(
+  sessionId: string,
+  bundle: {
+    stage1?: Stage1Response;
+    stage2?: unknown;
+    stage3?: unknown;
+    stage4?: Stage4Response;
+    stage5?: Stage5Response;
+    stage6?: Stage6Response;
+  },
+  signal?: AbortSignal
+): Promise<Stage7Response> {
+  const res = await fetch(`${API_BASE}/api/audit/stage/7`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, ...bundle }),
+    signal,
+  });
+  if (!res.ok) throw new Error(await readError(res, "Stage 7"));
+  return res.json();
+}
+
+/* ─────────────  Stage 8 (decision-intelligence report, 5 tabs)  ───────────── */
+
+export type Stage8Executive = {
+  model: string | null;
+  auc: number | null;
+  eo_gap: number | null;
+  status: string;
+  reason: string;
+  business_interpretation: string;
+};
+
+export type Stage8DisadvantagedGroup = {
+  attribute: string;
+  minority_group: string;
+  minority_n: number;
+  majority_group: string;
+  majority_n: number;
+  imbalance_ratio: number | null;
+};
+
+export type Stage8FairnessRisk = {
+  severity: "low" | "medium" | "high";
+  primary_bias_type: string;
+  statistical_root_cause: string | null;
+  ml_inferred_root_cause: string | null;
+  diagnoses_agree: boolean;
+  disadvantaged_groups: Stage8DisadvantagedGroup[];
+  evidence: {
+    chi2_p_value: number | null;
+    chi2_significant: boolean | null;
+    base_rate_gap_pp: number | null;
+    missingness_disparity_pp: number | null;
+    largest_imbalance_ratio: number | null;
+  };
+  inconsistencies: string[];
+};
+
+export type Stage8ModelBehavior = {
+  top_features: string[];
+  proxy_features: { feature: string; ratio: number | null }[];
+  correlated_features: { feature: string; smd: number | null }[];
+  shap_available: boolean;
+  narrative: string;
+};
+
+export type Stage8Actions = {
+  diagnosis: string | null;
+  summary: string | null;
+  safe_to_auto_fix: boolean;
+  warning: string | null;
+  actions: Stage6Action[];
+  blocked_count: number;
+  recommended_count: number;
+  verified_by_stage7: boolean;
+};
+
+export type Stage8DeploymentCondition = {
+  name: string;
+  passed: boolean;
+  detail: string;
+};
+
+export type Stage8Deployment = {
+  verdict: "deploy" | "conditional" | "do_not_deploy";
+  verdict_text: string;
+  passed_count: number;
+  total_conditions: number;
+  conditions: Stage8DeploymentCondition[];
+};
+
+export type Stage8Response = {
+  session_id: string;
+  executive: Stage8Executive;
+  fairness_risk: Stage8FairnessRisk;
+  model_behavior: Stage8ModelBehavior;
+  actions: Stage8Actions;
+  deployment: Stage8Deployment;
+  /** Optional executive headline written by Gemini. Null when LLM unavailable. */
+  executive_narrative: string | null;
+  /** "gemini" if any narrative in this report was LLM-generated, else "deterministic". */
+  llm_provider: "gemini" | "deterministic";
+  llm_model: string | null;
+};
+
+export async function runStage8(
+  sessionId: string,
+  bundle: {
+    stage1?: Stage1Response;
+    stage4?: Stage4Response;
+    stage5?: Stage5Response;
+    stage6?: Stage6Response;
+    stage7?: Stage7Response;
+  },
+  signal?: AbortSignal
+): Promise<Stage8Response> {
+  const res = await fetch(`${API_BASE}/api/audit/stage/8`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, ...bundle }),
+    signal,
+  });
+  if (!res.ok) throw new Error(await readError(res, "Stage 8"));
   return res.json();
 }
 

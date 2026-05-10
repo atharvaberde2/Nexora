@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Badge, Button, Card, CardHeader } from "@/components/primitives";
 import { cn } from "@/lib/cn";
-import { ReportTabs } from "@/components/report-tabs";
 import {
   runStage1,
   runStage2Stream,
@@ -11,6 +10,8 @@ import {
   runStage4,
   runStage5,
   runStage6,
+  runStage7,
+  runStage8,
   type Stage1Fingerprint,
   type Stage1Response,
   type Stage2Model,
@@ -26,6 +27,10 @@ import {
   type Stage6Response,
   type Stage6Action,
   type Stage6ActionStatus,
+  type Stage7Response,
+  type CP2PerModel,
+  type Stage8Response,
+  type Stage8DeploymentCondition,
 } from "@/lib/api";
 import type { ParsedCsv } from "@/lib/csv";
 import type { AuditConfig } from "./stage-configure";
@@ -81,6 +86,8 @@ type StageData = {
   stage4?: Stage4Response;
   stage5?: Stage5Response;
   stage6?: Stage6Response;
+  stage7?: Stage7Response;
+  stage8?: Stage8Response;
 };
 
 type StageDef = {
@@ -222,19 +229,32 @@ const PIPELINE: StageDef[] = [
   },
   {
     id: 7,
-    name: "Gemini reasoning layer",
-    desc: "Four schema-validated checkpoints, mathematically constrained to the Pareto-optimal set.",
-    meta: "GEMINI 1.5 PRO · PYDANTIC",
+    name: "Reasoning & validation layer",
+    desc: "Four Pydantic-validated checkpoints cross-check Stages 1–6 for consistency before issuing a final recommendation.",
+    meta: "PYDANTIC · 4 CHECKPOINTS · LIVE BACKEND",
     duration: 1100,
-    finding: () => "All four checkpoints passed · recommendation cross-checked",
+    finding: ({ data }) => {
+      const r = data.stage7;
+      if (!r) return "Reasoning checkpoints complete";
+      const rec = r.final_recommendation;
+      const verdict = rec.fairness_compliant && rec.pareto_status === "non-dominated"
+        ? `recommended ${rec.model}`
+        : "no recommendation gated through";
+      return `${r.checkpoints_summary} · ${verdict}`;
+    },
   },
   {
     id: 8,
-    name: "Three-audience report",
-    desc: "Engineer scorecard · Regulator submission · Community plain-language report.",
-    meta: "EN + ES · ELEVENLABS",
+    name: "Decision-intelligence report",
+    desc: "Five executive-grade tabs: summary · fairness & risk · model behavior · actions · deployment readiness.",
+    meta: "5 TABS · LIVE BACKEND",
     duration: 700,
-    finding: () => "3 reports rendered · Pydantic-validated · ready",
+    finding: ({ data }) => {
+      const r = data.stage8;
+      if (!r) return "Report rendered";
+      const v = r.deployment.verdict.replace(/_/g, " ");
+      return `${r.deployment.passed_count}/${r.deployment.total_conditions} deployment conditions met · verdict: ${v}`;
+    },
   },
 ];
 
@@ -470,6 +490,49 @@ export function RunningStage({
           if (cancelled) return;
           setData((d) => ({ ...d, stage6 }));
           finalize({ ...data, stage6 });
+        } else if (stage.id === 7) {
+          if (!data.stage2?.session_id) {
+            throw new Error("Stage 7 requires earlier stages to have completed first");
+          }
+          const [stage7] = await Promise.all([
+            runStage7(
+              data.stage2.session_id,
+              {
+                stage1: data.stage1,
+                stage2: data.stage2,
+                stage3: data.stage3,
+                stage4: data.stage4,
+                stage5: data.stage5,
+                stage6: data.stage6,
+              },
+              controller.signal
+            ),
+            new Promise<void>((r) => setTimeout(r, stage.duration)),
+          ]);
+          if (cancelled) return;
+          setData((d) => ({ ...d, stage7 }));
+          finalize({ ...data, stage7 });
+        } else if (stage.id === 8) {
+          if (!data.stage2?.session_id) {
+            throw new Error("Stage 8 requires earlier stages to have completed first");
+          }
+          const [stage8] = await Promise.all([
+            runStage8(
+              data.stage2.session_id,
+              {
+                stage1: data.stage1,
+                stage4: data.stage4,
+                stage5: data.stage5,
+                stage6: data.stage6,
+                stage7: data.stage7,
+              },
+              controller.signal
+            ),
+            new Promise<void>((r) => setTimeout(r, stage.duration)),
+          ]);
+          if (cancelled) return;
+          setData((d) => ({ ...d, stage8 }));
+          finalize({ ...data, stage8 });
         } else {
           await new Promise<void>((r) => setTimeout(r, stage.duration));
           if (cancelled) return;
@@ -947,8 +1010,14 @@ function StageArtifact({
     if (!data.stage6) return null;
     return <RemediationArtifact response={data.stage6} />;
   }
-  if (stageId === 7) return <GeminiArtifact />;
-  if (stageId === 8) return <ReportTabs />;
+  if (stageId === 7) {
+    if (!data.stage7) return null;
+    return <ReasoningCheckpointsArtifact response={data.stage7} />;
+  }
+  if (stageId === 8) {
+    if (!data.stage8) return null;
+    return <ExecutiveReportArtifact response={data.stage8} />;
+  }
   return null;
 }
 
@@ -1030,9 +1099,51 @@ function FingerprintPanel({
   const lb = result.label_bias;
   const smallest = result.groups[result.groups.length - 1];
   const allPowered = result.groups.every((g) => g.sufficient_power);
+  const pp = result.preprocessing;
 
   return (
-    <div className="grid lg:grid-cols-3 gap-5">
+    <>
+      {/* Preprocessing transparency — surfaces how many rows were dropped
+          for missing target or missing protected attribute. Shown only when
+          something was actually dropped, so happy paths stay clean. */}
+      {pp && pp.n_dropped_total > 0 && (
+        <div
+          className={cn(
+            "rounded-md border px-4 py-3 text-xs leading-relaxed mb-3",
+            (pp.drop_rate ?? 0) > 0.10
+              ? "border-warning/30 bg-warning/[0.06] text-warning"
+              : "border-hairline bg-elevated/30 text-ink-muted"
+          )}
+        >
+          <span className="font-medium">Preprocessing transparency · {protectedName}: </span>
+          {pp.n_dropped_total.toLocaleString()} of{" "}
+          <span className="font-mono">{pp.n_input.toLocaleString()}</span> rows
+          dropped before subgroup analysis
+          {pp.drop_rate != null && (
+            <span className="font-mono">
+              {" "}({(pp.drop_rate * 100).toFixed(1)}%)
+            </span>
+          )}
+          .{" "}
+          {pp.n_dropped_target_missing > 0 && (
+            <>
+              <span className="font-mono">{pp.n_dropped_target_missing}</span>{" "}
+              had a missing target value;{" "}
+            </>
+          )}
+          {pp.n_dropped_protected_missing > 0 && (
+            <>
+              <span className="font-mono">{pp.n_dropped_protected_missing}</span>{" "}
+              had a missing <span className="font-mono">{protectedName}</span> value
+              {(pp.drop_rate ?? 0) > 0.10 && (
+                <> — this is a meaningful share; consider whether the missingness is itself a fairness signal</>
+              )}
+              .
+            </>
+          )}
+        </div>
+      )}
+      <div className="grid lg:grid-cols-3 gap-5">
       {/* Group distribution + class-imbalance */}
       <Card className="lg:col-span-2 p-5">
         <div className="flex items-baseline justify-between mb-4">
@@ -1261,6 +1372,7 @@ function FingerprintPanel({
         </div>
       </Card>
     </div>
+    </>
   );
 }
 
@@ -1908,8 +2020,14 @@ function ParetoArtifact({ response }: { response: Stage4Response }) {
             <span className="text-warning font-medium">not</span> recommended.
           </li>
           <li>
+            <span className="text-ink font-medium">Reject degenerate models.</span>{" "}
+            A model that predicts a single class for every input has trivially zero
+            gaps and would slip through the previous filters — it's labeled{" "}
+            <span className="text-danger font-medium">Degenerate</span> and refused.
+          </li>
+          <li>
             <span className="text-ink font-medium">Highest accuracy wins.</span>{" "}
-            Among models that pass both filters, pick the one with the highest
+            Among models that pass all three filters, pick the one with the highest
             AUC. That's the{" "}
             <span className="text-success font-medium">recommended</span> model.
           </li>
@@ -2116,14 +2234,20 @@ function ParetoPanel({
                       : "—"}
                   </td>
                   <td className="py-2.5 px-2 pr-4 text-right">
-                    {m.recommended ? (
-                      <span title="Highest AUC among models that are Pareto-optimal AND satisfy the fairness threshold. The system's pick.">
+                    {m.degenerate ? (
+                      <span title={`Model predicts ${m.degenerate === "all-negative" ? "all 0" : "all 1"} for every input. Gaps are trivially zero but the model is decision-theoretically useless. Stage 4 explicitly refuses to recommend it.`}>
+                        <Badge tone="danger" dot>
+                          Degenerate
+                        </Badge>
+                      </span>
+                    ) : m.recommended ? (
+                      <span title="Highest AUC among models that are Pareto-optimal AND satisfy the fairness threshold AND are not degenerate. The system's pick.">
                         <Badge tone="success" dot>
                           Recommended
                         </Badge>
                       </span>
                     ) : m.pareto_optimal && !m.fairness_qualified ? (
-                      <span title="Pareto-optimal but disqualified from being recommended because its EO gap exceeds the fairness threshold. Fairness is enforced as a constraint, not a tiebreaker.">
+                      <span title="Pareto-optimal but disqualified because its EO gap exceeds the fairness threshold. Fairness is enforced as a constraint, not a tiebreaker.">
                         <Badge tone="warning" className="border-dashed">
                           Disqualified
                         </Badge>
@@ -2584,7 +2708,10 @@ function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: A
 
       {/* Header row: verdict + stats */}
       <div className="grid lg:grid-cols-3 gap-5">
-        {/* Bayesian posterior */}
+        {/* Bayesian posterior — real inference: discrete prior over 5 cause
+            classes × independent Gaussian likelihoods over standardized
+            observables, posterior via exact Bayes' rule, credible intervals
+            from Monte Carlo over observable bootstrap noise (n=2000). */}
         <Card className="lg:col-span-2 p-5">
           <div className="flex items-center justify-between mb-4">
             <div>
@@ -2592,7 +2719,7 @@ function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: A
                 Bayesian posterior · 5 classes
               </div>
               <div className="text-2xs text-ink-faint mt-0.5">
-                How likely each cause is, totalling 100%
+                Prior × Gaussian likelihood, MC-sampled (n=2,000) for credible intervals
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -2624,17 +2751,32 @@ function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: A
             {sorted.map(([key, val]) => {
               const pct = (val ?? 0) * 100;
               const isPrimary = key === primaryCause;
+              const full = firstAttr.bayesian_root_cause_full?.[key];
+              const ciLo = full?.ci_low != null ? full.ci_low * 100 : null;
+              const ciHi = full?.ci_high != null ? full.ci_high * 100 : null;
+              const prior = full?.prior;
               return (
                 <div key={key} title={CAUSE_PLAIN[key] ?? ""}>
                   <div className="flex items-center justify-between text-xs mb-1">
                     <span className={cn("text-ink-muted", isPrimary && "text-ink font-medium")}>
                       {CAUSE_LABELS[key] ?? key}
+                      {prior != null && (
+                        <span className="ml-1.5 text-2xs font-mono text-ink-faint">
+                          prior {(prior * 100).toFixed(0)}%
+                        </span>
+                      )}
                     </span>
                     <span className="font-mono tabular text-ink-dim">
                       {pct.toFixed(0)}%
+                      {ciLo != null && ciHi != null && (
+                        <span className="ml-1.5 text-2xs text-ink-faint">
+                          [{ciLo.toFixed(0)}–{ciHi.toFixed(0)}]
+                        </span>
+                      )}
                     </span>
                   </div>
-                  <div className="h-1.5 rounded-full bg-elevated overflow-hidden">
+                  {/* Bar with embedded 95% credible-interval whisker */}
+                  <div className="relative h-1.5 rounded-full bg-elevated overflow-hidden">
                     <div
                       className={cn(
                         "h-full transition-all duration-500",
@@ -2642,6 +2784,15 @@ function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: A
                       )}
                       style={{ width: `${pct}%` }}
                     />
+                    {ciLo != null && ciHi != null && (
+                      <div
+                        className="absolute top-1/2 -translate-y-1/2 h-3 border-l border-r border-ink-dim opacity-50 pointer-events-none"
+                        style={{
+                          left: `${ciLo}%`,
+                          width: `${Math.max(0, ciHi - ciLo)}%`,
+                        }}
+                      />
+                    )}
                   </div>
                   {/* Plain-English subtitle so each bar reads on its own */}
                   <div className="text-2xs text-ink-faint mt-1 leading-snug max-w-md">
@@ -2650,6 +2801,14 @@ function RootCauseArtifact({ response, cfg }: { response: Stage5Response; cfg: A
                 </div>
               );
             })}
+          </div>
+          <div className="mt-4 pt-3 border-t border-hairline text-2xs text-ink-faint leading-relaxed">
+            <span className="font-mono uppercase tracking-wider">Bayesian model:</span>{" "}
+            discrete prior over 5 cause classes (informed by fairness-ML literature) ×
+            independent Gaussian likelihoods over 6 standardized observables, posterior
+            via exact Bayes' rule, 95% credible intervals from Monte Carlo over
+            observable uncertainty (n=2,000 samples). Bars show posterior mean; whiskers
+            show credible interval.
           </div>
         </Card>
 
@@ -3171,55 +3330,741 @@ function RemediationCard({ action }: { action: Stage6Action }) {
   );
 }
 
-/* Stage 7 — Gemini reasoning checkpoints */
+/* Stage 7 — Reasoning & validation checkpoints (real backend) */
 
-function GeminiArtifact() {
-  const checkpoints = [
-    {
-      n: "1",
-      title: "Pareto frontier consistency",
-      body: "The model surfaced as recommended is on the Pareto frontier and dominates no other recommendation candidate.",
-      pass: true,
-    },
-    {
-      n: "2",
-      title: "Disparate impact threshold",
-      body: "Recommended model's disparate impact ratio (0.917) clears the 4/5ths regulatory floor (0.80).",
-      pass: true,
-    },
-    {
-      n: "3",
-      title: "Root-cause cross-check",
-      body: "Bayesian posterior (proxy discrimination, 73%) matches SHAP rank-delta evidence on priors_count.",
-      pass: true,
-    },
-    {
-      n: "4",
-      title: "Remediation safety",
-      body: "Threshold adjustment correctly blocked — would mask, not fix, proxy mechanism. Decorrelation flagged for application.",
-      pass: true,
-    },
-  ];
+function ReasoningCheckpointsArtifact({ response }: { response: Stage7Response }) {
+  const cp1 = response.bias_validation;
+  const cp2 = response.model_hypotheses;
+  const cp3 = response.root_cause_consistency;
+  const cp4 = response.final_recommendation;
+  const nar = response.narratives;
+  const usingGemini = nar.llm_provider === "gemini";
+
+  const cp1Passed = cp1.severity !== "high" && cp1.inconsistencies.length === 0;
+  const cp2Passed = cp2.verdict_summary === "confirmed" || cp2.verdict_summary === "rejected";
+  const cp3Passed = !cp3.disagreement_flag;
+  const cp4Passed = cp4.fairness_compliant && cp4.pareto_status === "non-dominated";
 
   return (
-    <div className="grid sm:grid-cols-2 gap-3">
-      {checkpoints.map((c) => (
-        <div
-          key={c.n}
-          className="rounded-md border border-hairline bg-elevated/40 p-4"
-        >
-          <div className="flex items-start justify-between mb-2">
-            <div className="text-2xs font-mono uppercase tracking-wider text-ink-dim">
-              Checkpoint {c.n}
-            </div>
-            <Badge tone="success" dot>
-              Pass
-            </Badge>
+    <div className="space-y-5">
+      {/* Plain-English summary panel — Gemini-generated when available */}
+      <div className="rounded-md border border-accent/20 bg-accent-soft/30 px-5 py-4">
+        <div className="flex items-baseline justify-between gap-2 mb-1.5">
+          <div className="flex items-baseline gap-2">
+            <span className="text-2xs font-mono uppercase tracking-[0.18em] text-accent">
+              In plain English
+            </span>
+            <span className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+              does the audit hold up?
+            </span>
           </div>
-          <div className="text-sm font-medium text-ink mb-1.5">{c.title}</div>
-          <p className="text-xs text-ink-muted leading-relaxed">{c.body}</p>
+          <LlmProviderBadge provider={nar.llm_provider} model={nar.llm_model} />
+        </div>
+        <p className="text-sm text-ink leading-relaxed mb-2">
+          {nar.executive_narrative}
+        </p>
+        <p className="text-xs text-ink-muted leading-relaxed">
+          Verdicts on every checkpoint come from{" "}
+          <span className="text-ink font-medium">Pydantic-validated deterministic logic</span>{" "}
+          — the LLM only writes the prose, never the pass/fail. Without an API key the prose
+          falls back to templates and the audit still works.{" "}
+          {response.all_checkpoints_passed ? (
+            <span className="text-success">All four checkpoints passed.</span>
+          ) : (
+            <span className="text-warning">
+              {[cp1Passed, cp2Passed, cp3Passed, cp4Passed].filter(Boolean).length}/4 checkpoints passed
+              — the failing ones are surfaced below.
+            </span>
+          )}
+        </p>
+        {!usingGemini && (
+          <div className="mt-2 text-2xs text-ink-faint leading-snug">
+            ⓘ To enable Gemini narratives, copy <span className="font-mono">backend/.env.example</span> to{" "}
+            <span className="font-mono">backend/.env</span> and set{" "}
+            <span className="font-mono">GEMINI_API_KEY</span>.
+          </div>
+        )}
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <CheckpointCard
+          n="1"
+          title="Bias-fingerprint validation"
+          subtitle="Recompute Stage 1 stats and flag internal contradictions"
+          passed={cp1Passed}
+          severity={cp1.severity}
+          narrative={nar.cp1}
+          usingGemini={usingGemini}
+          body={cp1.summary}
+          extra={
+            cp1.inconsistencies.length > 0 ? (
+              <ul className="space-y-1">
+                {cp1.inconsistencies.map((i, idx) => (
+                  <li key={idx} className="flex items-start gap-2 text-2xs text-warning leading-snug">
+                    <span className="font-mono mt-0.5">⚠</span>
+                    <span>{i}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null
+          }
+        />
+        <CheckpointCard
+          n="2"
+          title="Model-hypothesis consistency"
+          subtitle="Does higher AUC come with worse fairness on this dataset?"
+          passed={cp2Passed}
+          narrative={nar.cp2}
+          usingGemini={usingGemini}
+          body={
+            <>
+              {cp2.hypothesis}
+              {cp2.correlation_auc_eo != null && (
+                <>
+                  {" "}Pearson r ={" "}
+                  <span className="font-mono text-ink">
+                    {cp2.correlation_auc_eo.toFixed(3)}
+                  </span>{" "}
+                  · verdict:{" "}
+                  <span
+                    className={cn(
+                      "font-mono",
+                      cp2.verdict_summary === "confirmed" && "text-success",
+                      cp2.verdict_summary === "rejected" && "text-warning",
+                      cp2.verdict_summary === "ambiguous" && "text-ink-dim"
+                    )}
+                  >
+                    {cp2.verdict_summary}
+                  </span>
+                </>
+              )}
+            </>
+          }
+          extra={
+            cp2.per_model.length > 0 ? (
+              <CP2PerModelGrid rows={cp2.per_model} />
+            ) : null
+          }
+        />
+        <CheckpointCard
+          n="3"
+          title="Root-cause cross-validation"
+          subtitle="Statistical evidence vs SHAP-based diagnosis"
+          passed={cp3Passed}
+          narrative={nar.cp3}
+          usingGemini={usingGemini}
+          body={
+            <>
+              <div>
+                Statistical:{" "}
+                <span className="font-mono text-ink">
+                  {cp3.statistical_root_cause.replace(/_/g, " ")}
+                </span>
+              </div>
+              <div>
+                ML-inferred:{" "}
+                <span className="font-mono text-ink">
+                  {cp3.ml_inferred_root_cause.replace(/_/g, " ")}
+                </span>
+              </div>
+              <div className="mt-1">
+                {cp3.agree ? (
+                  <span className="text-success">Diagnoses agree</span>
+                ) : (
+                  <span className="text-warning">Disagreement — both reported</span>
+                )}
+              </div>
+            </>
+          }
+          extra={
+            cp3.notes.length > 0 || cp3.statistical_evidence.length > 0 ? (
+              <ul className="space-y-1">
+                {cp3.statistical_evidence.map((e, i) => (
+                  <li key={`ev-${i}`} className="text-2xs text-ink-muted leading-snug">
+                    · {e}
+                  </li>
+                ))}
+                {cp3.notes.map((n, i) => (
+                  <li key={`n-${i}`} className="text-2xs text-ink-muted leading-snug">
+                    · {n}
+                  </li>
+                ))}
+              </ul>
+            ) : null
+          }
+        />
+        <CheckpointCard
+          n="4"
+          title="Final recommendation gate"
+          subtitle="Refuses dominated or fairness-failing recommendations"
+          passed={cp4Passed}
+          narrative={nar.cp4}
+          usingGemini={usingGemini}
+          body={
+            <>
+              {cp4.model ? (
+                <div>
+                  <span className="text-ink font-medium">{cp4.model}</span>
+                  {" · AUC "}
+                  <span className="font-mono">
+                    {cp4.auc != null ? cp4.auc.toFixed(3) : "—"}
+                  </span>
+                  {" · EO gap "}
+                  <span className="font-mono">
+                    {cp4.eo_gap != null ? `${(cp4.eo_gap * 100).toFixed(1)}pp` : "—"}
+                  </span>
+                </div>
+              ) : (
+                <div className="text-warning">No model recommended</div>
+              )}
+              <div className="text-2xs text-ink-muted mt-1">{cp4.reason}</div>
+            </>
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+function CheckpointCard({
+  n,
+  title,
+  subtitle,
+  passed,
+  severity,
+  narrative,
+  usingGemini,
+  body,
+  extra,
+}: {
+  n: string;
+  title: string;
+  subtitle: string;
+  passed: boolean;
+  severity?: "low" | "medium" | "high";
+  narrative?: string;
+  usingGemini?: boolean;
+  body: React.ReactNode;
+  extra?: React.ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "rounded-md border bg-elevated/40 p-4 space-y-2",
+        passed ? "border-success/20" : "border-warning/30"
+      )}
+    >
+      <div className="flex items-start justify-between">
+        <div className="text-2xs font-mono uppercase tracking-wider text-ink-dim">
+          Checkpoint {n}
+        </div>
+        <div className="flex items-center gap-2">
+          {severity && (
+            <span
+              className={cn(
+                "text-2xs font-mono uppercase tracking-wider",
+                severity === "high" && "text-danger",
+                severity === "medium" && "text-warning",
+                severity === "low" && "text-ink-dim"
+              )}
+            >
+              severity: {severity}
+            </span>
+          )}
+          {passed ? (
+            <Badge tone="success" dot>Pass</Badge>
+          ) : (
+            <Badge tone="warning" dot>Review</Badge>
+          )}
+        </div>
+      </div>
+      <div className="text-sm font-medium text-ink">{title}</div>
+      <div className="text-2xs text-ink-faint uppercase tracking-wider">
+        {subtitle}
+      </div>
+      {narrative && (
+        <div
+          className={cn(
+            "rounded-md px-3 py-2 text-xs leading-relaxed border-l-2",
+            usingGemini
+              ? "bg-accent-soft/30 border-accent text-ink"
+              : "bg-elevated/60 border-hairline text-ink-muted"
+          )}
+        >
+          {usingGemini && (
+            <span className="text-2xs font-mono uppercase tracking-wider text-accent mr-1.5">
+              Gemini ·
+            </span>
+          )}
+          {narrative}
+        </div>
+      )}
+      <div className="text-xs text-ink-muted leading-relaxed">{body}</div>
+      {extra && <div className="pt-2 border-t border-hairline">{extra}</div>}
+    </div>
+  );
+}
+
+/** Small badge showing whether narratives in this stage came from Gemini or
+ *  fell back to deterministic templates. Lets judges/users know at a glance. */
+function LlmProviderBadge({
+  provider,
+  model,
+}: {
+  provider: "gemini" | "deterministic";
+  model: string | null;
+}) {
+  if (provider === "gemini") {
+    return (
+      <span
+        title={`Narratives generated by ${model ?? "Gemini"}; numbers and verdicts are deterministic.`}
+      >
+        <Badge tone="accent" dot>
+          Gemini {model ?? ""}
+        </Badge>
+      </span>
+    );
+  }
+  return (
+    <span title="No GEMINI_API_KEY configured — narratives are template-based.">
+      <Badge tone="neutral">Template prose</Badge>
+    </span>
+  );
+}
+
+function CP2PerModelGrid({ rows }: { rows: CP2PerModel[] }) {
+  return (
+    <div className="grid grid-cols-2 gap-1.5">
+      {rows.map((r) => (
+        <div
+          key={r.model_key}
+          className="flex items-baseline justify-between gap-1.5 text-2xs font-mono"
+        >
+          <span className="text-ink-muted truncate">{r.model_name}</span>
+          <span
+            className={cn(
+              r.verdict === "confirmed" && "text-success",
+              r.verdict === "rejected" && "text-warning",
+              r.verdict === "ambiguous" && "text-ink-dim",
+              r.verdict === "insufficient_data" && "text-ink-faint"
+            )}
+          >
+            {r.verdict}
+          </span>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* Stage 8 — Decision-intelligence report (5 tabs, real backend) */
+
+function ExecutiveReportArtifact({ response }: { response: Stage8Response }) {
+  const [tab, setTab] = useState<"exec" | "fairness" | "behavior" | "actions" | "deploy">("exec");
+  const TABS: { id: typeof tab; label: string; sub: string }[] = [
+    { id: "exec",     label: "Executive",    sub: "Recommendation" },
+    { id: "fairness", label: "Fairness & risk", sub: "Disparities" },
+    { id: "behavior", label: "Model behavior",  sub: "What it relies on" },
+    { id: "actions",  label: "Actions",         sub: "What to do" },
+    { id: "deploy",   label: "Deployment",      sub: "Go / no-go" },
+  ];
+  const usingGemini = response.llm_provider === "gemini";
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-md border border-accent/20 bg-accent-soft/30 px-5 py-4">
+        <div className="flex items-baseline justify-between gap-2 mb-1.5">
+          <div className="flex items-baseline gap-2">
+            <span className="text-2xs font-mono uppercase tracking-[0.18em] text-accent">
+              In plain English
+            </span>
+            <span className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+              decision-ready report
+            </span>
+          </div>
+          <LlmProviderBadge provider={response.llm_provider} model={response.llm_model} />
+        </div>
+        {response.executive_narrative ? (
+          <p className="text-sm text-ink leading-relaxed mb-2">
+            <span className="text-2xs font-mono uppercase tracking-wider text-accent mr-1.5">
+              Gemini ·
+            </span>
+            {response.executive_narrative}
+          </p>
+        ) : null}
+        <p className="text-sm text-ink-muted leading-relaxed">
+          Five tabs distilled from the eight statistical stages — written for a product manager,
+          executive, or compliance reviewer. Every <span className="text-ink">number</span> is
+          traceable back to a specific earlier stage;{" "}
+          {usingGemini ? (
+            <>the <span className="text-ink">prose</span> is written by Gemini under strict instructions to never invent or override the verdicts.</>
+          ) : (
+            <>the <span className="text-ink">prose</span> is template-based until you set <span className="font-mono">GEMINI_API_KEY</span> in <span className="font-mono">backend/.env</span>.</>
+          )}
+        </p>
+      </div>
+
+      {/* Tab nav */}
+      <div className="flex flex-wrap gap-1.5 border-b border-hairline pb-0">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={cn(
+              "px-3 py-2 text-xs font-medium rounded-t-md border-b-2 transition-colors",
+              tab === t.id
+                ? "border-accent text-ink bg-elevated/60"
+                : "border-transparent text-ink-muted hover:text-ink hover:bg-elevated/30"
+            )}
+          >
+            <div>{t.label}</div>
+            <div className="text-2xs text-ink-faint font-mono uppercase tracking-wider">
+              {t.sub}
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {tab === "exec" && <ExecutiveTab data={response.executive} />}
+      {tab === "fairness" && <FairnessRiskTab data={response.fairness_risk} />}
+      {tab === "behavior" && <ModelBehaviorTab data={response.model_behavior} />}
+      {tab === "actions" && <ActionsTab data={response.actions} />}
+      {tab === "deploy" && <DeploymentTab data={response.deployment} />}
+    </div>
+  );
+}
+
+function ExecutiveTab({ data }: { data: Stage8Response["executive"] }) {
+  return (
+    <Card className="p-5 space-y-4">
+      <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+        Recommended model
+      </div>
+      <div className="font-serif text-2xl text-ink">
+        {data.model ?? "No recommendation issued"}
+      </div>
+      {data.model && (
+        <div className="grid sm:grid-cols-3 gap-4">
+          <div>
+            <div className="text-2xs text-ink-faint uppercase tracking-wider">AUC</div>
+            <div className="font-mono tabular text-xl text-ink">
+              {data.auc != null ? data.auc.toFixed(3) : "—"}
+            </div>
+          </div>
+          <div>
+            <div className="text-2xs text-ink-faint uppercase tracking-wider">EO gap</div>
+            <div className="font-mono tabular text-xl text-ink">
+              {data.eo_gap != null ? `${(data.eo_gap * 100).toFixed(1)}pp` : "—"}
+            </div>
+          </div>
+          <div>
+            <div className="text-2xs text-ink-faint uppercase tracking-wider">Status</div>
+            <div className="font-mono text-xl text-ink">
+              {data.status.replace(/_/g, " ")}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="text-sm text-ink-muted leading-relaxed">{data.reason}</div>
+      <div className="rounded-md border border-hairline bg-elevated/30 px-4 py-3">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-1.5">
+          Business interpretation
+        </div>
+        <p className="text-sm text-ink leading-relaxed">
+          {data.business_interpretation}
+        </p>
+      </div>
+    </Card>
+  );
+}
+
+function FairnessRiskTab({ data }: { data: Stage8Response["fairness_risk"] }) {
+  const sevColor =
+    data.severity === "high" ? "text-danger" :
+    data.severity === "medium" ? "text-warning" : "text-success";
+  return (
+    <div className="space-y-4">
+      <Card className="p-5 space-y-3">
+        <div className="flex items-baseline justify-between">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+            Risk severity
+          </div>
+          <div className={cn("font-mono uppercase tracking-wider text-sm", sevColor)}>
+            {data.severity}
+          </div>
+        </div>
+        <div className="font-serif text-lg text-ink">
+          Primary bias type: {(data.primary_bias_type || "unknown").replace(/_/g, " ")}
+        </div>
+        {!data.diagnoses_agree && (
+          <div className="rounded-md border border-warning/30 bg-warning/[0.06] px-3 py-2 text-xs text-warning">
+            ⚠ Statistical and ML diagnoses disagree. Statistical:{" "}
+            <span className="font-mono">{data.statistical_root_cause}</span>; ML-inferred:{" "}
+            <span className="font-mono">{data.ml_inferred_root_cause}</span>. Manual review recommended.
+          </div>
+        )}
+      </Card>
+
+      {data.disadvantaged_groups.length > 0 && (
+        <Card className="p-5">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-3">
+            Disadvantaged groups
+          </div>
+          <div className="space-y-2">
+            {data.disadvantaged_groups.map((g) => {
+              const minFmt = formatGroup(g.attribute, g.minority_group);
+              const majFmt = formatGroup(g.attribute, g.majority_group);
+              return (
+                <div
+                  key={`${g.attribute}-${g.minority_group}`}
+                  className="text-sm text-ink-muted leading-relaxed"
+                >
+                  <span className="text-ink font-medium">
+                    {minFmt.display ?? g.minority_group}
+                  </span>{" "}
+                  <span className="font-mono text-2xs text-ink-faint">
+                    ({g.attribute} = {g.minority_group}, n = {g.minority_n})
+                  </span>{" "}
+                  is underrepresented vs.{" "}
+                  <span className="text-ink">{majFmt.display ?? g.majority_group}</span>{" "}
+                  <span className="font-mono text-2xs text-ink-faint">
+                    ({g.attribute} = {g.majority_group}, n = {g.majority_n})
+                  </span>
+                  {g.imbalance_ratio != null && (
+                    <span className="text-warning font-mono">
+                      {" — "}
+                      {g.imbalance_ratio.toFixed(1)}× ratio
+                    </span>
+                  )}
+                  .
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      <Card className="p-5">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-3">
+          Statistical evidence
+        </div>
+        <div className="grid sm:grid-cols-2 gap-3 text-xs font-mono">
+          <EvidenceRow
+            label="χ² p-value"
+            value={data.evidence.chi2_p_value != null ? data.evidence.chi2_p_value.toFixed(3) : "—"}
+            highlight={data.evidence.chi2_significant ? "warning" : null}
+          />
+          <EvidenceRow
+            label="Base-rate gap"
+            value={data.evidence.base_rate_gap_pp != null ? `${data.evidence.base_rate_gap_pp.toFixed(1)}pp` : "—"}
+          />
+          <EvidenceRow
+            label="Missingness disparity"
+            value={data.evidence.missingness_disparity_pp != null ? `${data.evidence.missingness_disparity_pp.toFixed(1)}pp` : "—"}
+          />
+          <EvidenceRow
+            label="Largest imbalance ratio"
+            value={data.evidence.largest_imbalance_ratio != null ? `${data.evidence.largest_imbalance_ratio.toFixed(1)}×` : "—"}
+          />
+        </div>
+        {data.inconsistencies.length > 0 && (
+          <ul className="mt-3 pt-3 border-t border-hairline space-y-1">
+            {data.inconsistencies.map((i, idx) => (
+              <li key={idx} className="flex items-start gap-2 text-2xs text-warning leading-snug">
+                <span className="font-mono mt-0.5">⚠</span>
+                <span>{i}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+function EvidenceRow({
+  label,
+  value,
+  highlight,
+}: {
+  label: string;
+  value: string;
+  highlight?: "warning" | null;
+}) {
+  return (
+    <div className="flex items-baseline justify-between">
+      <span className="text-ink-dim uppercase tracking-wider text-2xs">{label}</span>
+      <span className={cn("text-ink", highlight === "warning" && "text-warning")}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function ModelBehaviorTab({ data }: { data: Stage8Response["model_behavior"] }) {
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-2">
+          What the model relies on
+        </div>
+        <p className="text-sm text-ink leading-relaxed">{data.narrative}</p>
+        {!data.shap_available && (
+          <div className="mt-3 text-2xs text-ink-faint uppercase tracking-wider">
+            Note: SHAP wasn't available — feature importance is correlation-based.
+          </div>
+        )}
+      </Card>
+
+      {data.top_features.length > 0 && (
+        <Card className="p-5">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-3">
+            Top features (across groups)
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {data.top_features.map((f) => (
+              <span
+                key={f}
+                className="rounded-full border border-hairline bg-elevated/40 px-3 py-1 text-xs font-mono text-ink"
+              >
+                {f}
+              </span>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {data.proxy_features.length > 0 && (
+        <Card className="p-5">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-3">
+            Possible proxy features
+          </div>
+          <p className="text-xs text-ink-muted mb-3 leading-relaxed">
+            These features are notably more influential for one group than the
+            other — even though the protected attribute itself was excluded from training.
+            They may be acting as indirect signals.
+          </p>
+          <div className="space-y-2">
+            {data.proxy_features.map((p) => (
+              <div key={p.feature} className="flex items-baseline justify-between text-sm">
+                <span className="font-mono text-ink">{p.feature}</span>
+                <span className="font-mono text-warning">
+                  {p.ratio != null ? `${p.ratio.toFixed(1)}×` : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function ActionsTab({ data }: { data: Stage8Response["actions"] }) {
+  return (
+    <div className="space-y-4">
+      {data.diagnosis && (
+        <Card className="p-5 space-y-2">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+            Diagnosis
+          </div>
+          <div className="font-serif text-lg text-ink">{data.diagnosis}</div>
+          {data.summary && (
+            <p className="text-sm text-ink-muted leading-relaxed">{data.summary}</p>
+          )}
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-2xs font-mono uppercase tracking-wider pt-1">
+            <span className="text-success">{data.recommended_count} recommended</span>
+            <span className="text-danger">{data.blocked_count} blocked</span>
+            <span className={cn(data.safe_to_auto_fix ? "text-success" : "text-warning")}>
+              {data.safe_to_auto_fix ? "safe to apply" : "manual review required"}
+            </span>
+            {data.verified_by_stage7 && (
+              <span className="text-accent">verified by Stage 7</span>
+            )}
+          </div>
+          {data.warning && (
+            <div className="rounded-md border border-warning/30 bg-warning/[0.06] px-3 py-2 text-xs text-warning leading-relaxed">
+              {data.warning}
+            </div>
+          )}
+        </Card>
+      )}
+
+      <div className="grid lg:grid-cols-3 gap-4">
+        {data.actions.map((a) => (
+          <RemediationCard key={a.id} action={a} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DeploymentTab({ data }: { data: Stage8Response["deployment"] }) {
+  const verdictColor =
+    data.verdict === "deploy" ? "text-success" :
+    data.verdict === "conditional" ? "text-warning" : "text-danger";
+  const VerdictBadge = (
+    <Badge
+      tone={
+        data.verdict === "deploy" ? "success" :
+        data.verdict === "conditional" ? "warning" : "danger"
+      }
+      dot
+    >
+      {data.verdict.replace(/_/g, " ")}
+    </Badge>
+  );
+  return (
+    <div className="space-y-4">
+      <Card className="p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim">
+            Deployment verdict
+          </div>
+          {VerdictBadge}
+        </div>
+        <div className={cn("font-serif text-2xl mb-2", verdictColor)}>
+          {data.verdict.replace(/_/g, " ")}
+        </div>
+        <p className="text-sm text-ink-muted leading-relaxed mb-3">{data.verdict_text}</p>
+        <div className="text-2xs font-mono text-ink-dim uppercase tracking-wider">
+          {data.passed_count} of {data.total_conditions} conditions met
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <div className="text-2xs uppercase tracking-[0.18em] text-ink-dim mb-3">
+          Deployment conditions
+        </div>
+        <div className="space-y-2">
+          {data.conditions.map((c, i) => (
+            <DeploymentConditionRow key={i} condition={c} />
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function DeploymentConditionRow({ condition }: { condition: Stage8DeploymentCondition }) {
+  return (
+    <div
+      className={cn(
+        "rounded-md border px-3 py-2.5",
+        condition.passed
+          ? "border-success/20 bg-success/[0.04]"
+          : "border-warning/30 bg-warning/[0.04]"
+      )}
+    >
+      <div className="flex items-baseline justify-between">
+        <div className="text-sm text-ink font-medium">{condition.name}</div>
+        <span className={cn("text-2xs font-mono uppercase tracking-wider", condition.passed ? "text-success" : "text-warning")}>
+          {condition.passed ? "✓ pass" : "⚠ fail"}
+        </span>
+      </div>
+      {condition.detail && (
+        <div className="text-2xs text-ink-muted mt-1">{condition.detail}</div>
+      )}
     </div>
   );
 }

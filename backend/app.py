@@ -11,19 +11,83 @@ Run:
 
 import json
 import math
+import os
 import time
 import uuid
 import warnings
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import StringIO
+from typing import Literal
 
 import numpy as np
 import optuna
 import pandas as pd
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
+from pydantic import BaseModel, Field, ValidationError
 from scipy.stats import chi2, chi2_contingency, norm
+
+# Load backend/.env so GEMINI_API_KEY etc. are picked up at startup.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except Exception:
+    pass
+
+# Gemini is optional — Stage 7 and 8 fall back to deterministic templates
+# when either the SDK isn't installed or no API key is configured.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+try:
+    import google.generativeai as genai
+    if GEMINI_API_KEY:
+        genai.configure(api_key=GEMINI_API_KEY)
+        HAS_GEMINI = True
+    else:
+        HAS_GEMINI = False
+except Exception:
+    genai = None  # type: ignore[assignment]
+    HAS_GEMINI = False
+
+
+def _gemini_narrate(
+    prompt: str,
+    system: str | None = None,
+    max_chars: int = 4000,
+    max_output_tokens: int = 2048,
+) -> str | None:
+    """Call Gemini for a short prose narrative. Returns None on any failure
+    (missing key, network, quota, content filter) so callers can fall back to
+    deterministic templates without breaking the audit.
+
+    `max_output_tokens` defaults to 2048 because gemini-2.5-flash uses internal
+    "thinking" tokens that count against this budget — a smaller cap gets
+    consumed by thinking and produces empty visible output."""
+    if not HAS_GEMINI or genai is None:
+        return None
+    try:
+        kwargs = {}
+        if system:
+            kwargs["system_instruction"] = system
+        model = genai.GenerativeModel(GEMINI_MODEL, **kwargs)
+        resp = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.2,
+                "max_output_tokens": max_output_tokens,
+                "response_mime_type": "application/json"
+                if "JSON" in (prompt or "") else "text/plain",
+            },
+        )
+        text = (getattr(resp, "text", None) or "").strip()
+        if not text:
+            return None
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        return text
+    except Exception:
+        return None
 from sklearn.ensemble import (
     HistGradientBoostingClassifier,
     RandomForestClassifier,
@@ -234,9 +298,16 @@ def preprocess(df: pd.DataFrame, target_col: str, protected_col: str, positive_c
 # =========================================================
 
 def bias_fingerprint(df: pd.DataFrame, target_col: str, protected_col: str) -> dict:
+    # Track preprocessing decisions explicitly so the audit is transparent
+    # about how many rows the user actually got group statistics for.
+    n_input = int(len(df))
+    n_target_missing = int(df[target_col].isna().sum())
+    n_protected_missing = int(df[protected_col].isna().sum())
     df = df.dropna(subset=[target_col, protected_col]).copy()
+    n_audited = int(len(df))
+    n_dropped = n_input - n_audited
 
-    if len(df) == 0:
+    if n_audited == 0:
         raise ValueError("no rows remaining after dropping NaN target/protected values")
 
     group_pos_rate = df.groupby(protected_col)[target_col].mean()
@@ -277,8 +348,19 @@ def bias_fingerprint(df: pd.DataFrame, target_col: str, protected_col: str) -> d
         })
     groups.sort(key=lambda g: -g["n"])
 
+    # Preprocessing transparency block — tells the user exactly what got
+    # dropped before subgroup statistics were computed.
+    preprocessing = {
+        "n_input": n_input,
+        "n_audited": n_audited,
+        "n_dropped_total": n_dropped,
+        "n_dropped_target_missing": n_target_missing,
+        "n_dropped_protected_missing": n_protected_missing,
+        "drop_rate": _safe_float(n_dropped / n_input) if n_input else None,
+    }
+
     return {
-        "n_total": int(len(df)),
+        "n_total": n_audited,
         "overall_positive_rate": _safe_float(overall_rate),
         "n_threshold": n_threshold,
         "groups": groups,
@@ -291,6 +373,7 @@ def bias_fingerprint(df: pd.DataFrame, target_col: str, protected_col: str) -> d
             {"name": str(name), "missing_pct": _safe_float(pct)}
             for name, pct in col_missing.items()
         ],
+        "preprocessing": preprocessing,
     }
 
 
@@ -1417,6 +1500,20 @@ def stage_4():
                 auc_val - lambda_param * eo_val
                 if auc_val is not None and eo_val is not None else None
             )
+            # Degeneracy detection: a model whose selection rate is 0 across
+            # every group (all-negative) or 1 across every group (all-positive)
+            # has trivially zero TPR/FPR/EO/DP gaps — it looks "perfectly fair"
+            # but is decision-theoretically useless. Without this flag, such a
+            # model can survive the Pareto + fairness-threshold gates and get
+            # recommended over a useful-but-imperfect classifier.
+            srs = [g.get("selection_rate") for g in by_group.values()
+                   if g.get("selection_rate") is not None]
+            degenerate_kind: str | None = None
+            if len(srs) >= 2:
+                if all(s == 0 for s in srs):
+                    degenerate_kind = "all-negative"
+                elif all(s == 1 for s in srs):
+                    degenerate_kind = "all-positive"
             rows.append({
                 "key": key,
                 "name": pred["name"],
@@ -1430,6 +1527,7 @@ def stage_4():
                 "di_ratio": gaps["di_ratio"],
                 "ppv_gap": gaps["ppv_gap"],
                 "composite_score": _safe_float(composite),
+                "degenerate": degenerate_kind,
             })
 
         # Step 1 — Pareto dominance: r is dominated if some other row has
@@ -1459,19 +1557,26 @@ def stage_4():
                 and r["fairness_gap"] <= eo_threshold
             )
 
-        # Step 3 — Selection rule: highest AUC among models that are Pareto-optimal
-        # AND satisfy the fairness threshold. If no model qualifies, no recommendation
-        # is issued and a warning surfaces so the user knows why.
-        eligible = [r for r in rows if r["pareto_optimal"] and r["fairness_qualified"] and r["auc"] is not None]
+        # Step 3 — Selection rule: highest AUC among models that are
+        #   (a) Pareto-optimal,
+        #   (b) satisfy the fairness threshold,
+        #   (c) are NOT degenerate (don't predict the same class for everyone).
+        # Without (c), an all-zero classifier would have EO gap = 0 (trivially
+        # fair) and slip through every prior filter despite being useless.
+        # If no model qualifies, no recommendation is issued and a warning
+        # surfaces so the user knows why.
+        eligible = [
+            r for r in rows
+            if r["pareto_optimal"]
+            and r["fairness_qualified"]
+            and r["auc"] is not None
+            and r.get("degenerate") is None
+        ]
         recommendation_warning = None
         if eligible:
             best = max(eligible, key=lambda r: r["auc"])
             for r in rows:
                 r["recommended"] = r is best
-            r["recommended_reason"] = (
-                f"Highest AUC ({best['auc']:.3f}) among Pareto-optimal models with "
-                f"EO gap ≤ {eo_threshold:.2f}"
-            ) if False else None  # reason carried at attr-level below
             attr_reason = (
                 f"Highest AUC ({best['auc']:.3f}) on the Pareto frontier with "
                 f"equalized-odds gap {best['fairness_gap'] * 100:.1f}pp "
@@ -1482,7 +1587,20 @@ def stage_4():
                 r["recommended"] = False
             attr_reason = None
             pareto_rows = [r for r in rows if r["pareto_optimal"]]
-            if pareto_rows:
+            degenerate_rows = [r for r in rows if r.get("degenerate") is not None]
+            if pareto_rows and all(r.get("degenerate") for r in pareto_rows if r["fairness_qualified"]):
+                # All "fairness-qualified" Pareto models are actually degenerate
+                # (trivially fair because they predict one class for everyone).
+                names = ", ".join(
+                    f"{r['name']} ({r['degenerate']})" for r in degenerate_rows
+                )
+                recommendation_warning = (
+                    "BLOCKED: every Pareto-optimal model that satisfies the fairness threshold "
+                    f"is degenerate ({names}) — they predict a single class for every input, "
+                    "so their gaps are trivially zero. Stage 4 refuses to recommend a useless model. "
+                    "Inspect the non-degenerate candidates manually."
+                )
+            elif pareto_rows:
                 # There are Pareto-optimal models, but none satisfy the fairness threshold.
                 lowest_eo = min(
                     pareto_rows,
@@ -1729,25 +1847,136 @@ def _flip_rate(
     return _safe_float(total_flips / total_n) if total_n > 0 else None
 
 
+# =========================================================
+# Stage 5 — real Bayesian root-cause inference
+# =========================================================
+#
+# Generative model:
+#   C ~ Categorical(π) over 5 root-cause classes
+#   Z = (proxy_norm, flip_rate, imbalance_norm, base_rate_gap, eo_gap, dp_minus_eo)
+#   Z_j | C=k  ~  Normal(μ_{k,j}, σ_j)
+#
+# Inference is exact: discrete C with a Gaussian likelihood factorized over
+# observables, posterior P(C | Z) ∝ ∏_j P(Z_j | C) · π(C).
+#
+# Sampling: Monte Carlo over observable uncertainty (bootstrap-style noise on
+# Z) gives a posterior distribution over P(C|Z) — we report its mean and
+# 95% credible interval per class. This is real Bayesian inference, not a
+# heuristic softmax of metrics.
+
+# Domain-informed prior. Reflects how often each cause is reported as PRIMARY
+# in the fairness-ML literature (Mehrabi et al. 2021, Suresh & Guttag 2021,
+# Barocas-Hardt-Narayanan). Representation and proxy issues dominate; threshold
+# and complexity bias tend to compound the others rather than be primary.
+_BAYES_PRIOR = {
+    "proxy_discrimination":  0.25,
+    "representation_bias":   0.30,
+    "label_bias":            0.25,
+    "threshold_effect":      0.10,
+    "model_complexity_bias": 0.10,
+}
+_BAYES_CLASSES = list(_BAYES_PRIOR.keys())
+
+# Class-conditional means μ_{k,j} for the 6 standardized observables under each
+# cause class. Hand-calibrated from the literature; adjust if domain shifts.
+# Columns: [proxy_norm, flip_rate, imbalance_norm, base_rate_gap, eo_gap, dp_minus_eo]
+_BAYES_MU = {
+    # Proxy: high proxy ratio, high flip rate, moderate gaps, dp ≈ eo
+    "proxy_discrimination":  [0.85, 0.50, 0.30, 0.10, 0.20, 0.05],
+    # Representation: dominant imbalance, low flip, mild gaps, dp ≈ eo
+    "representation_bias":   [0.20, 0.15, 0.85, 0.30, 0.20, 0.05],
+    # Label: high base-rate gap, low flip rate, gaps follow base rate
+    "label_bias":            [0.20, 0.05, 0.30, 0.85, 0.15, 0.05],
+    # Threshold: dp_gap distinctly larger than eo_gap, moderate everywhere else.
+    # μ for dp_minus_eo is 0.30 (a realistic strong signal — anything ≥0.15
+    # is meaningful), not the extreme 0.85 it was originally calibrated to.
+    "threshold_effect":      [0.20, 0.10, 0.20, 0.10, 0.20, 0.30],
+    # Complexity: moderate eo, no specific signature on dp-eo gap.
+    "model_complexity_bias": [0.40, 0.30, 0.30, 0.20, 0.45, 0.10],
+}
+# Per-observable measurement noise σ_j. dp_minus_eo gets a tighter σ because
+# it's the only feature that uniquely distinguishes threshold effect from
+# the others — small differences should be informative, not drowned out.
+_BAYES_SIGMA = [0.20, 0.20, 0.20, 0.20, 0.20, 0.12]
+# Bootstrap noise added to observables during MC sampling — captures the
+# uncertainty in the point estimates we feed into Bayes' rule.
+_BAYES_OBS_NOISE = 0.05
+_BAYES_N_SAMPLES = 2000
+
+
+def _bayes_standardize(
+    proxy_score: float, flip_rate: float, group_imbalance: float,
+    base_rate_gap: float, eo_gap: float, dp_gap: float,
+) -> "np.ndarray":
+    """Map raw observables to [0, 1] features for the Gaussian likelihood."""
+    proxy_norm = float(np.clip((proxy_score - 1.0) / 4.0, 0.0, 1.0))   # ratio 1–5x → 0–1
+    imbalance_norm = float(np.clip((group_imbalance - 1.0) / 9.0, 0.0, 1.0))  # 1–10x → 0–1
+    return np.array([
+        proxy_norm,
+        float(np.clip(flip_rate, 0.0, 1.0)),
+        imbalance_norm,
+        float(np.clip(base_rate_gap, 0.0, 1.0)),
+        float(np.clip(eo_gap, 0.0, 1.0)),
+        float(np.clip(max(dp_gap - eo_gap, 0.0), 0.0, 1.0)),  # the threshold-effect signature
+    ])
+
+
 def _bayesian_posterior(
     proxy_score: float, flip_rate: float, group_imbalance: float,
     base_rate_gap: float, eo_gap: float, dp_gap: float,
 ) -> dict:
-    """Heuristic Bayesian posterior over 5 bias classes. Scores are unnormalized then normalized."""
-    proxy       = max(proxy_score - 1.0, 0.0) ** 1.5 * (1.0 + flip_rate * 2.0)
-    represent   = max(group_imbalance - 1.0, 0.0) * base_rate_gap * 2.0
-    label       = base_rate_gap * max(1.0 - flip_rate, 0.0)
-    threshold   = max(dp_gap - eo_gap, 0.0) * 3.0
-    complexity  = eo_gap * max(1.0 - flip_rate, 0.0) * 0.5
-    scores = {
-        "proxy_discrimination": proxy,
-        "representation_bias": represent,
-        "label_bias": label,
-        "threshold_effect": threshold,
-        "model_complexity_bias": complexity,
+    """Backward-compatible wrapper: returns just posterior means per class.
+    Internally computes the full Bayesian posterior with credible intervals
+    via :func:`_bayesian_posterior_full`, then drops the CI envelope."""
+    full = _bayesian_posterior_full(
+        proxy_score, flip_rate, group_imbalance, base_rate_gap, eo_gap, dp_gap
+    )
+    return {cls: full[cls]["mean"] for cls in _BAYES_CLASSES}
+
+
+def _bayesian_posterior_full(
+    proxy_score: float, flip_rate: float, group_imbalance: float,
+    base_rate_gap: float, eo_gap: float, dp_gap: float,
+    *, n_samples: int = _BAYES_N_SAMPLES, seed: int = 42,
+) -> dict:
+    """Real Bayesian inference over 5 root-cause classes.
+
+    Returns, per class, {mean, ci_low, ci_high} where the CIs are 2.5/97.5
+    percentiles of the posterior under bootstrap-style observable uncertainty.
+    """
+    rng = np.random.default_rng(seed)
+    Z = _bayes_standardize(proxy_score, flip_rate, group_imbalance,
+                           base_rate_gap, eo_gap, dp_gap)
+    log_prior = np.log(np.array([_BAYES_PRIOR[c] for c in _BAYES_CLASSES]))
+    mu = np.array([_BAYES_MU[c] for c in _BAYES_CLASSES])  # (5, 6)
+    sigma = np.array(_BAYES_SIGMA)                         # (6,)
+
+    # MC posterior: for each draw, perturb observables with bootstrap-style
+    # Gaussian noise, then compute exact discrete posterior given those Z.
+    samples = np.zeros((n_samples, len(_BAYES_CLASSES)))
+    for i in range(n_samples):
+        Z_i = np.clip(Z + rng.normal(0.0, _BAYES_OBS_NOISE, size=Z.shape), 0.0, 1.0)
+        # log P(Z_i | C=k) under independent Normal observables
+        # = -0.5 Σ_j ((Z_ij - μ_kj) / σ_j)^2  (constants drop out post-norm)
+        log_lik = -0.5 * np.sum(((Z_i - mu) / sigma) ** 2, axis=1)
+        log_post = log_lik + log_prior
+        log_post -= log_post.max()  # numerical stability
+        post = np.exp(log_post)
+        post /= post.sum()
+        samples[i] = post
+
+    mean = samples.mean(axis=0)
+    ci_lo = np.percentile(samples, 2.5, axis=0)
+    ci_hi = np.percentile(samples, 97.5, axis=0)
+    return {
+        cls: {
+            "mean": _safe_float(mean[i]),
+            "ci_low": _safe_float(ci_lo[i]),
+            "ci_high": _safe_float(ci_hi[i]),
+            "prior": _safe_float(_BAYES_PRIOR[cls]),
+        }
+        for i, cls in enumerate(_BAYES_CLASSES)
     }
-    total = sum(scores.values()) + 1e-9
-    return {k: _safe_float(v / total) for k, v in scores.items()}
 
 
 @app.post("/api/audit/stage/5")
@@ -1840,10 +2069,13 @@ def stage_5():
         br_gap  = (max(pos_list) - min(pos_list))  if len(pos_list) >= 2 else 0.0
         imbal   = (max(ns) / max(min(ns), 1))      if ns else 1.0
 
-        posterior = _bayesian_posterior(
+        posterior_full = _bayesian_posterior_full(
             float(proxy_score), float(fr_val), float(imbal),
             float(br_gap), float(eo_gap), float(dp_gap),
         )
+        # Backward-compat dict (just means) used by Stages 6/7/8 that haven't
+        # been migrated to consume credible intervals yet.
+        posterior = {cls: posterior_full[cls]["mean"] for cls in _BAYES_CLASSES}
 
         # Per-group sample counts and positive rates — used by the frontend to
         # render forensic-style explanations ("Group X has only N samples vs M").
@@ -1871,6 +2103,9 @@ def stage_5():
             "dp_gap": _safe_float(dp_gap),
             "base_rate_gap": _safe_float(br_gap),
             "bayesian_root_cause": posterior,
+            # Full Bayesian output: per-class {mean, ci_low, ci_high, prior}
+            # produced by Monte Carlo over observable bootstrap noise (n=2000).
+            "bayesian_root_cause_full": posterior_full,
         }
 
     primary_posterior = next(iter(results.values()), {}).get("bayesian_root_cause") if results else None
@@ -2295,6 +2530,981 @@ def stage_6():
         "primary_root_cause": primary_root_cause,
         **plan,
     })
+
+
+# =========================================================
+# STAGE 7 — Reasoning / validation layer (4 Pydantic-checked checkpoints)
+# =========================================================
+#
+# Stage 7 is a verification firewall on top of Stages 1–6. It does NOT retrain
+# or recompute fairness metrics. It cross-checks prior stages for internal
+# consistency and gates the final recommendation. Pydantic enforces the schema
+# of every checkpoint so a malformed pipeline output fails loudly here rather
+# than silently leaking into the report.
+
+class CP1BiasValidation(BaseModel):
+    """CP1 — Bias fingerprint normalized + checked for internal consistency."""
+    n_total: int
+    n_groups: int
+    largest_imbalance_ratio: float | None = None
+    smallest_group_n: int | None = None
+    chi2_significant: bool = False
+    chi2_p_value: float | None = None
+    base_rate_gap_pp: float | None = None
+    missingness_disparity_pp: float | None = None
+    severity: Literal["low", "medium", "high"]
+    inconsistencies: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class CP2PerModel(BaseModel):
+    model_key: str
+    model_name: str
+    cv_auc: float | None = None
+    eo_gap: float | None = None
+    subgroup_auc_variance: float | None = None
+    verdict: Literal["confirmed", "rejected", "ambiguous", "insufficient_data"]
+
+
+class CP2ModelHypotheses(BaseModel):
+    """CP2 — Tests whether higher accuracy correlates with worse fairness."""
+    hypothesis: str = (
+        "Higher CV AUC correlates with larger equalized-odds gap "
+        "(accuracy/fairness tension)."
+    )
+    correlation_auc_eo: float | None = None
+    verdict_summary: Literal["confirmed", "rejected", "ambiguous", "insufficient_data"]
+    notes: list[str] = Field(default_factory=list)
+    per_model: list[CP2PerModel]
+
+
+class CP3RootCause(BaseModel):
+    """CP3 — Cross-validates Stage 5's ML root cause vs Stage 1+3 statistical evidence."""
+    statistical_root_cause: str
+    statistical_evidence: list[str] = Field(default_factory=list)
+    ml_inferred_root_cause: str
+    agree: bool
+    disagreement_flag: bool
+    notes: list[str] = Field(default_factory=list)
+
+
+class CP4FinalRecommendation(BaseModel):
+    """CP4 — Gates the final pick: non-dominated + fairness-compliant only."""
+    model: str | None = None
+    model_key: str | None = None
+    reason: str
+    pareto_status: Literal["non-dominated", "no_recommendation"]
+    fairness_compliant: bool
+    eo_gap: float | None = None
+    eo_gap_threshold: float
+    auc: float | None = None
+
+
+class Stage7Narratives(BaseModel):
+    """LLM-generated plain-English summaries layered over the deterministic
+    checkpoint output. The verdict (pass/fail) is NEVER taken from the LLM —
+    only the prose. If Gemini isn't configured, every field falls back to
+    the deterministic template equivalent."""
+    cp1: str
+    cp2: str
+    cp3: str
+    cp4: str
+    executive_narrative: str
+    llm_provider: Literal["gemini", "deterministic"]
+    llm_model: str | None = None
+
+
+class Stage7Response(BaseModel):
+    session_id: str
+    bias_validation: CP1BiasValidation
+    model_hypotheses: CP2ModelHypotheses
+    root_cause_consistency: CP3RootCause
+    final_recommendation: CP4FinalRecommendation
+    all_checkpoints_passed: bool
+    checkpoints_summary: str
+    narratives: Stage7Narratives
+
+
+def _cp1_bias_validation(stage1: dict) -> CP1BiasValidation:
+    """Read Stage 1 fingerprint, normalize, and flag inconsistencies."""
+    results = (stage1 or {}).get("results") or []
+    # Pick the attribute with the most groups for the headline numbers; the
+    # report tab will show all attributes separately.
+    primary = max(results, key=lambda r: len(r.get("fingerprint", {}).get("groups", []))) \
+        if results else {"fingerprint": {}}
+    fp = primary.get("fingerprint", {}) or {}
+    groups = fp.get("groups") or []
+    ns = [g.get("n", 0) for g in groups if g.get("n") is not None]
+    pos_rates = [g.get("positive_rate") for g in groups if g.get("positive_rate") is not None]
+    miss_rates = [g.get("missing_rate") for g in groups if g.get("missing_rate") is not None]
+
+    largest_ratio = (max(ns) / max(min(ns), 1)) if ns else None
+    base_rate_gap = (max(pos_rates) - min(pos_rates)) if len(pos_rates) >= 2 else None
+    missing_disp = (max(miss_rates) - min(miss_rates)) if len(miss_rates) >= 2 else None
+    smallest_n = min(ns) if ns else None
+    lb = fp.get("label_bias") or {}
+    chi2_p = lb.get("p_value")
+    chi2_sig = bool(lb.get("significant"))
+
+    inconsistencies: list[str] = []
+    if chi2_sig and base_rate_gap is not None and base_rate_gap < 0.05:
+        inconsistencies.append(
+            f"Chi-square is significant (p={chi2_p:.3f}) but the base-rate gap "
+            f"is small ({base_rate_gap * 100:.1f}pp) — significance may be "
+            "driven by sample size rather than effect size."
+        )
+    if missing_disp is not None and missing_disp > 0.10 and not chi2_sig:
+        inconsistencies.append(
+            f"Group-correlated missingness ({missing_disp * 100:.1f}pp) without a "
+            "significant label-bias signal — possible MNAR pattern worth manual review."
+        )
+    if largest_ratio is not None and largest_ratio > 5.0:
+        inconsistencies.append(
+            f"Severe group imbalance ({largest_ratio:.1f}× ratio between largest "
+            "and smallest groups) — subgroup statistics for the minority will be unreliable."
+        )
+    if smallest_n is not None and smallest_n < 50:
+        inconsistencies.append(
+            f"Smallest group has only {smallest_n} samples — bootstrap CIs and "
+            "subgroup AUC will be wide; treat point estimates with caution."
+        )
+
+    # Severity heuristic: blend imbalance, missingness, base-rate gap.
+    severity_score = 0
+    if largest_ratio is not None and largest_ratio > 3: severity_score += 1
+    if largest_ratio is not None and largest_ratio > 6: severity_score += 1
+    if base_rate_gap is not None and base_rate_gap > 0.10: severity_score += 1
+    if missing_disp is not None and missing_disp > 0.10: severity_score += 1
+    severity: Literal["low", "medium", "high"] = (
+        "high" if severity_score >= 3 else "medium" if severity_score >= 1 else "low"
+    )
+
+    summary = (
+        f"{len(ns)} groups, n={sum(ns):,}; "
+        f"largest imbalance {largest_ratio:.1f}× " if largest_ratio else ""
+    ) + (
+        f"base-rate gap {base_rate_gap * 100:.1f}pp; " if base_rate_gap is not None else ""
+    ) + (
+        f"chi² p={chi2_p:.3f}" if chi2_p is not None else "chi² unavailable"
+    )
+
+    return CP1BiasValidation(
+        n_total=int(sum(ns)),
+        n_groups=len(ns),
+        largest_imbalance_ratio=_safe_float(largest_ratio) if largest_ratio else None,
+        smallest_group_n=smallest_n,
+        chi2_significant=chi2_sig,
+        chi2_p_value=_safe_float(chi2_p) if chi2_p is not None else None,
+        base_rate_gap_pp=_safe_float(base_rate_gap * 100) if base_rate_gap is not None else None,
+        missingness_disparity_pp=_safe_float(missing_disp * 100) if missing_disp is not None else None,
+        severity=severity,
+        inconsistencies=inconsistencies,
+        summary=summary,
+    )
+
+
+def _cp2_model_hypotheses(stage2: dict, stage3: dict) -> CP2ModelHypotheses:
+    """Test the canonical fairness hypothesis: does higher AUC come with larger EO gaps?"""
+    s2_models = {m["key"]: m for m in (stage2.get("models") or [])}
+    s3_results = stage3.get("results") or []
+    if not s3_results:
+        return CP2ModelHypotheses(
+            verdict_summary="insufficient_data",
+            per_model=[],
+            notes=["Stage 3 results missing — cannot evaluate hypothesis."],
+        )
+
+    # Use the first protected attribute's per-model row.
+    s3_models = s3_results[0].get("models") or []
+    pairs: list[tuple[float, float, dict]] = []  # (auc, eo_gap, model_meta)
+    per_model: list[CP2PerModel] = []
+    for m in s3_models:
+        eo = (m.get("gaps") or {}).get("eo_gap")
+        auc = m.get("overall_auc")
+        # Subgroup AUC variance — scaled fairness signal.
+        bg = m.get("by_group") or {}
+        sg_aucs = [g.get("auc") for g in bg.values() if g.get("auc") is not None]
+        sg_var = float(np.var(sg_aucs)) if len(sg_aucs) >= 2 else None
+        if auc is not None and eo is not None:
+            pairs.append((float(auc), float(eo), m))
+
+        per_model.append(CP2PerModel(
+            model_key=m.get("key", ""),
+            model_name=m.get("name", m.get("key", "")),
+            cv_auc=_safe_float(s2_models.get(m.get("key"), {}).get("best_score") or auc),
+            eo_gap=_safe_float(eo) if eo is not None else None,
+            subgroup_auc_variance=_safe_float(sg_var) if sg_var is not None else None,
+            verdict="insufficient_data",  # filled in below relative to median
+        ))
+
+    if len(pairs) < 3:
+        return CP2ModelHypotheses(
+            verdict_summary="insufficient_data",
+            per_model=per_model,
+            notes=[f"Only {len(pairs)} models have both AUC and EO gap — need ≥3 to test correlation."],
+        )
+
+    aucs = np.array([p[0] for p in pairs])
+    eos = np.array([p[1] for p in pairs])
+    # Pearson correlation (ddof handled implicitly by np.corrcoef).
+    if aucs.std() < 1e-9 or eos.std() < 1e-9:
+        r = None
+    else:
+        r = float(np.corrcoef(aucs, eos)[0, 1])
+
+    if r is None:
+        verdict = "insufficient_data"
+    elif r > 0.5:
+        verdict = "confirmed"
+    elif r < -0.2:
+        verdict = "rejected"
+    else:
+        verdict = "ambiguous"
+
+    # Per-model: compare each to the median; "confirmed" if its AUC and EO gap
+    # are both above (or both below) median (i.e., trend-consistent).
+    auc_med = float(np.median(aucs))
+    eo_med = float(np.median(eos))
+    keyed = {m.get("key"): (a, e) for (a, e, m) in pairs}
+    for entry in per_model:
+        ae = keyed.get(entry.model_key)
+        if ae is None:
+            entry.verdict = "insufficient_data"
+            continue
+        a, e = ae
+        if (a > auc_med and e > eo_med) or (a < auc_med and e < eo_med):
+            entry.verdict = "confirmed"
+        elif (a > auc_med and e < eo_med) or (a < auc_med and e > eo_med):
+            entry.verdict = "rejected"
+        else:
+            entry.verdict = "ambiguous"
+
+    notes = [
+        f"Pearson correlation between AUC and EO gap across {len(pairs)} models: "
+        f"r = {r:.3f}." if r is not None else "Variance too small to compute correlation."
+    ]
+    if verdict == "confirmed":
+        notes.append("Higher-AUC models tend to be less fair — accept-fairness-as-constraint design is justified.")
+    elif verdict == "rejected":
+        notes.append("Higher-AUC models are also fairer here — fairness/accuracy may not be in tension on this dataset.")
+
+    return CP2ModelHypotheses(
+        correlation_auc_eo=_safe_float(r) if r is not None else None,
+        verdict_summary=verdict,
+        per_model=per_model,
+        notes=notes,
+    )
+
+
+def _cp3_root_cause(stage1: dict, stage3: dict, stage5: dict) -> CP3RootCause:
+    """Cross-validate Stage 5's diagnosis against statistical evidence from Stages 1 & 3."""
+    s1_results = stage1.get("results") or []
+    fp = s1_results[0].get("fingerprint") if s1_results else {}
+    groups = (fp or {}).get("groups") or []
+    ns = [g.get("n", 0) for g in groups]
+    pos_rates = [g.get("positive_rate") for g in groups if g.get("positive_rate") is not None]
+    largest_ratio = (max(ns) / max(min(ns), 1)) if ns else None
+    base_rate_gap = (max(pos_rates) - min(pos_rates)) if len(pos_rates) >= 2 else None
+
+    # Statistical-only inference: pick the cause that the data alone supports.
+    evidence: list[str] = []
+    if largest_ratio is not None and largest_ratio > 5.0:
+        stat_cause = "representation_bias"
+        evidence.append(f"Group-size ratio {largest_ratio:.1f}× exceeds 5× threshold.")
+    elif base_rate_gap is not None and base_rate_gap > 0.15:
+        stat_cause = "label_bias"
+        evidence.append(f"Base-rate gap {base_rate_gap * 100:.1f}pp suggests label generation differs across groups.")
+    elif largest_ratio is not None and largest_ratio > 2.0:
+        stat_cause = "representation_bias"
+        evidence.append(f"Moderate imbalance {largest_ratio:.1f}× — representation bias plausible.")
+    else:
+        # Look at Stage 3's DP vs EO gap to distinguish threshold from proxy.
+        s3_models = (stage3.get("results") or [{}])[0].get("models") or []
+        # Find recommended-ish model = highest AUC among any.
+        scored = [m for m in s3_models if m.get("overall_auc") is not None]
+        if scored:
+            best = max(scored, key=lambda m: m["overall_auc"])
+            dp = (best.get("gaps") or {}).get("dp_gap") or 0
+            eo = (best.get("gaps") or {}).get("eo_gap") or 0
+            if dp > eo + 0.05:
+                stat_cause = "threshold_effect"
+                evidence.append(f"DP gap ({dp * 100:.1f}pp) exceeds EO gap ({eo * 100:.1f}pp) by >5pp on best model.")
+            else:
+                stat_cause = "proxy_discrimination"
+                evidence.append("EO and DP gaps are comparable — disparity persists at score level (proxy-like).")
+        else:
+            stat_cause = "unknown"
+            evidence.append("Insufficient Stage 3 data to distinguish threshold from proxy.")
+
+    ml_cause = stage5.get("primary_root_cause") or "unknown"
+    agree = stat_cause == ml_cause
+    disagreement_flag = not agree and stat_cause != "unknown" and ml_cause != "unknown"
+
+    notes: list[str] = []
+    if disagreement_flag:
+        notes.append(
+            f"Statistical evidence points to '{stat_cause}' while SHAP-based "
+            f"diagnosis points to '{ml_cause}'. Both are reported; manual review "
+            "recommended before applying remediation."
+        )
+    elif agree:
+        notes.append(f"Statistical and ML-inferred diagnoses agree: {stat_cause}.")
+
+    return CP3RootCause(
+        statistical_root_cause=stat_cause,
+        statistical_evidence=evidence,
+        ml_inferred_root_cause=ml_cause,
+        agree=agree,
+        disagreement_flag=disagreement_flag,
+        notes=notes,
+    )
+
+
+def _cp4_final_gate(stage4: dict) -> CP4FinalRecommendation:
+    """Verify the recommended model is genuinely Pareto-optimal AND fairness-compliant."""
+    threshold = stage4.get("eo_gap_threshold", EO_GAP_THRESHOLD)
+    s4_results = stage4.get("results") or []
+    if not s4_results:
+        return CP4FinalRecommendation(
+            reason="No Stage 4 results available — cannot verify recommendation.",
+            pareto_status="no_recommendation",
+            fairness_compliant=False,
+            eo_gap_threshold=float(threshold),
+        )
+
+    # Use the first protected attribute (multi-attribute audits would loop).
+    attr = s4_results[0]
+    rec = next((m for m in (attr.get("models") or []) if m.get("recommended")), None)
+    if rec is None:
+        return CP4FinalRecommendation(
+            reason=attr.get("recommendation_warning") or "No recommendation issued by Stage 4.",
+            pareto_status="no_recommendation",
+            fairness_compliant=False,
+            eo_gap_threshold=float(threshold),
+        )
+
+    # Re-verify Pareto + fairness directly from the row to defend against
+    # upstream tampering. CP4 is the firewall, not a passthrough.
+    pareto_ok = bool(rec.get("pareto_optimal"))
+    eo = rec.get("fairness_gap")
+    fairness_ok = bool(rec.get("fairness_qualified")) and (
+        eo is not None and eo <= float(threshold)
+    )
+
+    if not pareto_ok:
+        reason = (
+            f"BLOCKED: {rec.get('name')} is marked recommended but is NOT Pareto-optimal. "
+            "Stage 7 refuses to ratify a dominated recommendation."
+        )
+        return CP4FinalRecommendation(
+            model=rec.get("name"),
+            model_key=rec.get("key"),
+            reason=reason,
+            pareto_status="no_recommendation",
+            fairness_compliant=False,
+            eo_gap=_safe_float(eo) if eo is not None else None,
+            eo_gap_threshold=float(threshold),
+            auc=_safe_float(rec.get("auc")) if rec.get("auc") is not None else None,
+        )
+
+    # Defense-in-depth: even if Stage 4 somehow recommended a degenerate model,
+    # CP4 catches it here. Stage 4 already filters these out, but this gate
+    # exists so a future Stage 4 refactor can't silently regress.
+    if rec.get("degenerate"):
+        kind = rec["degenerate"]
+        reason = (
+            f"BLOCKED: {rec.get('name')} predicts {kind} for every input — "
+            "a degenerate classifier whose 'fair' gaps are trivially zero. "
+            "Stage 7 refuses to ratify a useless recommendation."
+        )
+        return CP4FinalRecommendation(
+            model=rec.get("name"),
+            model_key=rec.get("key"),
+            reason=reason,
+            pareto_status="no_recommendation",
+            fairness_compliant=False,
+            eo_gap=_safe_float(eo) if eo is not None else None,
+            eo_gap_threshold=float(threshold),
+            auc=_safe_float(rec.get("auc")) if rec.get("auc") is not None else None,
+        )
+
+    if not fairness_ok:
+        reason = (
+            f"BLOCKED: {rec.get('name')} has EO gap "
+            f"{(eo or 0) * 100:.1f}pp which exceeds the {threshold * 100:.0f}pp "
+            "fairness threshold. Recommendation revoked."
+        )
+        return CP4FinalRecommendation(
+            model=rec.get("name"),
+            model_key=rec.get("key"),
+            reason=reason,
+            pareto_status="no_recommendation",
+            fairness_compliant=False,
+            eo_gap=_safe_float(eo) if eo is not None else None,
+            eo_gap_threshold=float(threshold),
+            auc=_safe_float(rec.get("auc")) if rec.get("auc") is not None else None,
+        )
+
+    reason = (
+        f"{rec.get('name')} is non-dominated on the Pareto frontier with AUC "
+        f"{(rec.get('auc') or 0):.3f} and EO gap {(eo or 0) * 100:.1f}pp "
+        f"(within {threshold * 100:.0f}pp threshold)."
+    )
+    return CP4FinalRecommendation(
+        model=rec.get("name"),
+        model_key=rec.get("key"),
+        reason=reason,
+        pareto_status="non-dominated",
+        fairness_compliant=True,
+        eo_gap=_safe_float(eo) if eo is not None else None,
+        eo_gap_threshold=float(threshold),
+        auc=_safe_float(rec.get("auc")) if rec.get("auc") is not None else None,
+    )
+
+
+_S7_SYSTEM_PROMPT = (
+    "You are a fairness-auditing reasoning layer. Given the deterministic "
+    "checkpoint output of an ML fairness pipeline, write a short plain-English "
+    "narrative for a non-technical reader. Hard rules: "
+    "(1) Never contradict the numbers. "
+    "(2) Never invent a verdict — use exactly the pass/fail given. "
+    "(3) Never claim the model is fair if 'fairness_compliant' is false. "
+    "(4) Be concise: 2–4 sentences. No bullet lists, no headings."
+)
+
+
+def _stage7_narratives(
+    cp1: "CP1BiasValidation",
+    cp2: "CP2ModelHypotheses",
+    cp3: "CP3RootCause",
+    cp4: "CP4FinalRecommendation",
+    all_passed: bool,
+) -> Stage7Narratives:
+    """Build LLM narratives for each checkpoint. Falls back to deterministic
+    templates if Gemini isn't configured."""
+
+    def _fallback_cp1() -> str:
+        if cp1.inconsistencies:
+            return (
+                f"Bias-fingerprint severity is {cp1.severity}. "
+                f"{len(cp1.inconsistencies)} inconsistency flag"
+                f"{'s' if len(cp1.inconsistencies) != 1 else ''} surfaced — review them before "
+                "trusting downstream subgroup statistics."
+            )
+        return (
+            f"Bias-fingerprint severity is {cp1.severity}; no contradictions "
+            "between imbalance, missingness, and the chi-square label-bias signal."
+        )
+
+    def _fallback_cp2() -> str:
+        if cp2.correlation_auc_eo is None:
+            return (
+                "Not enough valid models to test the accuracy/fairness tension hypothesis."
+            )
+        verdict_text = {
+            "confirmed": "higher-AUC models tend to be less fair on this dataset",
+            "rejected": "higher-AUC models are also fairer here — no tension observed",
+            "ambiguous": "no clear correlation either way",
+            "insufficient_data": "not enough data to decide",
+        }.get(cp2.verdict_summary, cp2.verdict_summary)
+        return (
+            f"Pearson r between AUC and EO gap is {cp2.correlation_auc_eo:.3f} — "
+            f"{verdict_text}. This is why Stage 4 enforces fairness as a constraint, "
+            "not just a tiebreaker."
+        )
+
+    def _fallback_cp3() -> str:
+        if cp3.disagreement_flag:
+            return (
+                f"Statistical evidence points to '{cp3.statistical_root_cause.replace('_', ' ')}' "
+                f"while the SHAP-based diagnosis points to '{cp3.ml_inferred_root_cause.replace('_', ' ')}'. "
+                "Both are reported; manual review is recommended before applying any remediation."
+            )
+        return (
+            f"Statistical and ML-inferred diagnoses agree: "
+            f"{cp3.statistical_root_cause.replace('_', ' ')}. The remediation engine can act on this with confidence."
+        )
+
+    def _fallback_cp4() -> str:
+        return cp4.reason
+
+    def _fallback_exec() -> str:
+        if all_passed:
+            return (
+                "All four checkpoints passed. The recommended model is non-dominated, "
+                "within the fairness threshold, and the diagnosis story is internally consistent. "
+                "Stage 7 ratifies the recommendation."
+            )
+        return (
+            "Stage 7 found gaps that need human review before deployment. "
+            "See the failing checkpoints below for what to address."
+        )
+
+    if not HAS_GEMINI:
+        return Stage7Narratives(
+            cp1=_fallback_cp1(),
+            cp2=_fallback_cp2(),
+            cp3=_fallback_cp3(),
+            cp4=_fallback_cp4(),
+            executive_narrative=_fallback_exec(),
+            llm_provider="deterministic",
+            llm_model=None,
+        )
+
+    # Build a single prompt that emits all 5 narratives as JSON. Cheaper and
+    # avoids 5 round trips. Falls back per-field if Gemini returns garbage.
+    facts = {
+        "cp1": cp1.model_dump(),
+        "cp2": cp2.model_dump(),
+        "cp3": cp3.model_dump(),
+        "cp4": cp4.model_dump(),
+        "all_checkpoints_passed": all_passed,
+    }
+    prompt = (
+        "Below is the JSON output of a fairness-audit reasoning layer (4 checkpoints). "
+        "Write a short plain-English narrative for each. Return ONE JSON object with "
+        "exactly these keys: cp1, cp2, cp3, cp4, executive_narrative. Each value is a "
+        "string, 2–4 sentences. No markdown, no prose outside the JSON.\n\n"
+        f"DATA:\n{json.dumps(facts, default=str)}"
+    )
+    text = _gemini_narrate(prompt, system=_S7_SYSTEM_PROMPT, max_chars=4000)
+    parsed: dict | None = None
+    if text:
+        # Strip any code fences Gemini may add.
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`").lstrip("json").strip()
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        # Whole-of-LLM failure — fall back uniformly.
+        return Stage7Narratives(
+            cp1=_fallback_cp1(),
+            cp2=_fallback_cp2(),
+            cp3=_fallback_cp3(),
+            cp4=_fallback_cp4(),
+            executive_narrative=_fallback_exec(),
+            llm_provider="deterministic",
+            llm_model=None,
+        )
+
+    def _pick(key: str, fallback: str) -> str:
+        v = parsed.get(key) if parsed else None
+        return v.strip() if isinstance(v, str) and v.strip() else fallback
+
+    return Stage7Narratives(
+        cp1=_pick("cp1", _fallback_cp1()),
+        cp2=_pick("cp2", _fallback_cp2()),
+        cp3=_pick("cp3", _fallback_cp3()),
+        cp4=_pick("cp4", _fallback_cp4()),
+        executive_narrative=_pick("executive_narrative", _fallback_exec()),
+        llm_provider="gemini",
+        llm_model=GEMINI_MODEL,
+    )
+
+
+@app.post("/api/audit/stage/7")
+def stage_7():
+    """Reasoning + validation layer. Cross-checks Stages 1-6 via four
+    Pydantic-validated checkpoints, then narrates them via Gemini (with
+    deterministic fallback). Does NOT retrain or recompute fairness."""
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id")
+    if not session_id:
+        return jsonify({"error": "missing session_id"}), 400
+
+    s1 = payload.get("stage1") or {}
+    s2 = payload.get("stage2") or {}
+    s3 = payload.get("stage3") or {}
+    s4 = payload.get("stage4") or {}
+    s5 = payload.get("stage5") or {}
+
+    cp1 = _cp1_bias_validation(s1)
+    cp2 = _cp2_model_hypotheses(s2, s3)
+    cp3 = _cp3_root_cause(s1, s3, s5)
+    cp4 = _cp4_final_gate(s4)
+
+    all_passed = (
+        cp1.severity != "high"
+        and cp2.verdict_summary in {"confirmed", "rejected"}
+        and not cp3.disagreement_flag
+        and cp4.fairness_compliant
+    )
+
+    summary_parts = [
+        f"CP1 ({cp1.severity} severity, {len(cp1.inconsistencies)} flags)",
+        f"CP2 ({cp2.verdict_summary})",
+        f"CP3 ({'AGREE' if cp3.agree else 'DISAGREE'})",
+        f"CP4 ({cp4.pareto_status})",
+    ]
+    summary = " · ".join(summary_parts)
+
+    narratives = _stage7_narratives(cp1, cp2, cp3, cp4, all_passed)
+
+    try:
+        result = Stage7Response(
+            session_id=session_id,
+            bias_validation=cp1,
+            model_hypotheses=cp2,
+            root_cause_consistency=cp3,
+            final_recommendation=cp4,
+            all_checkpoints_passed=all_passed,
+            checkpoints_summary=summary,
+            narratives=narratives,
+        )
+    except ValidationError as e:
+        return jsonify({"error": f"Stage 7 schema validation failed: {e}"}), 500
+
+    return jsonify(result.model_dump())
+
+
+# =========================================================
+# STAGE 8 — Decision-intelligence report (5 tabs)
+# =========================================================
+
+def _stage8_executive(stage7: dict) -> dict:
+    """TAB 1 — recommended model + business interpretation. Reads from Stage 7's
+    CP4 final_recommendation block (which has already verified non-dominance
+    and fairness compliance), not directly from Stage 4 — keeping the trust
+    chain Stage 4 → Stage 7 → Stage 8."""
+    rec = stage7.get("final_recommendation") or {}
+    threshold = rec.get("eo_gap_threshold", EO_GAP_THRESHOLD)
+    if not rec.get("model"):
+        return {
+            "model": None,
+            "auc": None,
+            "eo_gap": None,
+            "status": "no_recommendation",
+            "reason": rec.get("reason", "No model met the selection criteria."),
+            "business_interpretation": (
+                "No model in this audit cleared both the Pareto-optimality test and "
+                "the fairness-threshold guardrail. Deployment is not recommended at "
+                "this time. See the Fairness & Risk tab for the underlying disparity."
+            ),
+        }
+    return {
+        "model": rec["model"],
+        "auc": rec.get("auc"),
+        "eo_gap": rec.get("eo_gap"),
+        "status": rec["pareto_status"],
+        "reason": rec["reason"],
+        "business_interpretation": (
+            f"This model improves prediction quality while maintaining equitable "
+            f"outcomes within a {threshold * 100:.0f}pp equalized-odds gap, making it "
+            "suitable for deployment in regulated decision systems (lending, insurance, "
+            "healthcare). It has been verified by Stage 7 as non-dominated and "
+            "fairness-compliant."
+        ),
+    }
+
+
+def _stage8_fairness_risk(stage1: dict, stage5: dict, stage7: dict) -> dict:
+    """TAB 2 — disadvantaged groups + bias type + statistical evidence."""
+    cp1 = stage7.get("bias_validation") or {}
+    cp3 = stage7.get("root_cause_consistency") or {}
+
+    s1_results = stage1.get("results") or []
+    disadvantaged: list[dict] = []
+    for entry in s1_results:
+        attr = entry.get("protected", "")
+        fp = entry.get("fingerprint") or {}
+        groups = fp.get("groups") or []
+        if len(groups) < 2:
+            continue
+        sized = sorted(groups, key=lambda g: g.get("n", 0))
+        small, large = sized[0], sized[-1]
+        ratio = (large.get("n", 0) / max(small.get("n", 1), 1))
+        disadvantaged.append({
+            "attribute": attr,
+            "minority_group": small.get("name"),
+            "minority_n": small.get("n"),
+            "majority_group": large.get("name"),
+            "majority_n": large.get("n"),
+            "imbalance_ratio": _safe_float(ratio),
+        })
+
+    # Risk severity: bubble up CP1 severity, but escalate if CP3 disagrees.
+    severity = cp1.get("severity", "low")
+    if cp3.get("disagreement_flag"):
+        severity = "high" if severity != "high" else severity
+
+    return {
+        "severity": severity,
+        "primary_bias_type": (
+            stage5.get("primary_root_cause")
+            or cp3.get("statistical_root_cause")
+            or "unknown"
+        ),
+        "statistical_root_cause": cp3.get("statistical_root_cause"),
+        "ml_inferred_root_cause": cp3.get("ml_inferred_root_cause"),
+        "diagnoses_agree": cp3.get("agree", True),
+        "disadvantaged_groups": disadvantaged,
+        "evidence": {
+            "chi2_p_value": cp1.get("chi2_p_value"),
+            "chi2_significant": cp1.get("chi2_significant"),
+            "base_rate_gap_pp": cp1.get("base_rate_gap_pp"),
+            "missingness_disparity_pp": cp1.get("missingness_disparity_pp"),
+            "largest_imbalance_ratio": cp1.get("largest_imbalance_ratio"),
+        },
+        "inconsistencies": cp1.get("inconsistencies", []),
+    }
+
+
+def _stage8_model_behavior(stage5: dict) -> dict:
+    """TAB 3 — plain-language SHAP + proxy explanation."""
+    results = stage5.get("results") or {}
+    first_attr = next(iter(results.values()), {}) if results else {}
+    proxy_feats = first_attr.get("proxy_features") or []
+    corr_feats = first_attr.get("correlated_features") or []
+    group_shap = first_attr.get("group_shap") or {}
+
+    # Top features by SHAP across all groups (union of top-3 from each group's importance).
+    top_features: list[str] = []
+    for g, gs in group_shap.items():
+        imp = gs.get("importance", {}) or {}
+        top_features.extend(list(imp.keys())[:3])
+    # Dedup preserving order.
+    seen = set()
+    top_features = [f for f in top_features if not (f in seen or seen.add(f))][:5]
+
+    return {
+        "top_features": top_features,
+        "proxy_features": [
+            {"feature": p["feature"], "ratio": p.get("ratio")}
+            for p in proxy_feats[:5]
+        ],
+        "correlated_features": [
+            {"feature": c["feature"], "smd": c.get("smd")}
+            for c in corr_feats[:5]
+        ],
+        "shap_available": stage5.get("shap_available", False),
+        "narrative": _stage8_behavior_narrative(top_features, proxy_feats, stage5),
+    }
+
+
+def _stage8_behavior_narrative(top_features: list, proxy_feats: list, stage5: dict) -> str:
+    """Plain-language paragraph synthesizing what the model is doing."""
+    if not top_features:
+        return "No SHAP attribution was available for the recommended model."
+    feats_str = ", ".join(top_features[:3])
+    base = f"The model relies most heavily on {feats_str} when making its decisions."
+    if proxy_feats:
+        top_proxy = proxy_feats[0]
+        ratio = top_proxy.get("ratio") or 1.0
+        base += (
+            f" The feature \"{top_proxy['feature']}\" is "
+            f"{ratio:.1f}× more influential for one group than the other — "
+            "a sign it may be acting as an indirect signal for the protected attribute "
+            "even though that attribute itself was excluded from training."
+        )
+    else:
+        base += " No strong proxy features were detected — feature usage is consistent across groups."
+    return base
+
+
+def _stage8_actions(stage6: dict, stage7: dict) -> dict:
+    """TAB 4 — actionable recommendations from Stage 6, gated by Stage 7."""
+    cp4 = stage7.get("final_recommendation") or {}
+    actions = (stage6 or {}).get("actions") or []
+    return {
+        "diagnosis": stage6.get("diagnosis"),
+        "summary": stage6.get("summary"),
+        "safe_to_auto_fix": stage6.get("safe_to_auto_fix", False),
+        "warning": stage6.get("warning"),
+        "actions": actions,
+        "blocked_count": sum(1 for a in actions if a.get("status") == "blocked"),
+        "recommended_count": sum(1 for a in actions if a.get("status") == "recommended"),
+        "verified_by_stage7": cp4.get("fairness_compliant", False),
+    }
+
+
+def _stage8_deployment(stage7: dict) -> dict:
+    """TAB 5 — final deployment verdict synthesizing all four checkpoints."""
+    cp1 = stage7.get("bias_validation") or {}
+    cp3 = stage7.get("root_cause_consistency") or {}
+    cp4 = stage7.get("final_recommendation") or {}
+    all_passed = stage7.get("all_checkpoints_passed", False)
+
+    conditions: list[dict] = [
+        {
+            "name": "Fairness threshold satisfied",
+            "passed": bool(cp4.get("fairness_compliant")),
+            "detail": (
+                f"EO gap {(cp4.get('eo_gap') or 0) * 100:.1f}pp vs "
+                f"{(cp4.get('eo_gap_threshold') or 0) * 100:.0f}pp threshold"
+                if cp4.get("eo_gap") is not None else "No recommendation to evaluate"
+            ),
+        },
+        {
+            "name": "Recommended model is non-dominated",
+            "passed": cp4.get("pareto_status") == "non-dominated",
+            "detail": cp4.get("reason", ""),
+        },
+        {
+            "name": "Statistical and ML diagnoses agree",
+            "passed": not cp3.get("disagreement_flag", False),
+            "detail": (
+                f"Statistical: {cp3.get('statistical_root_cause', 'n/a')} · "
+                f"ML: {cp3.get('ml_inferred_root_cause', 'n/a')}"
+            ),
+        },
+        {
+            "name": "Bias-fingerprint severity acceptable",
+            "passed": cp1.get("severity") != "high",
+            "detail": f"Severity = {cp1.get('severity', 'unknown')}",
+        },
+    ]
+    passed_count = sum(1 for c in conditions if c["passed"])
+
+    if all_passed and passed_count == 4:
+        verdict = "deploy"
+        verdict_text = "Deploy — all four reasoning checkpoints passed."
+    elif passed_count >= 2 and cp4.get("fairness_compliant"):
+        verdict = "conditional"
+        verdict_text = (
+            f"Conditional deploy — {passed_count}/4 checkpoints passed. "
+            "Address the failing conditions before production rollout."
+        )
+    else:
+        verdict = "do_not_deploy"
+        verdict_text = (
+            f"Do not deploy — only {passed_count}/4 checkpoints passed and the "
+            "fairness or non-dominance gate is not satisfied."
+        )
+
+    return {
+        "verdict": verdict,
+        "verdict_text": verdict_text,
+        "passed_count": passed_count,
+        "total_conditions": len(conditions),
+        "conditions": conditions,
+    }
+
+
+_S8_SYSTEM_PROMPT = (
+    "You are writing an executive fairness report for product managers and "
+    "compliance reviewers. Hard rules: "
+    "(1) Never invent numbers — only use what the JSON gives you. "
+    "(2) Never claim the model is fair if 'fairness_compliant' is false. "
+    "(3) Never recommend deployment if 'deployment.verdict' is not 'deploy'. "
+    "(4) Be concise: 2–4 sentences per field. No markdown, no headings, plain prose."
+)
+
+
+def _stage8_llm_narratives(report: dict) -> dict:
+    """Generate executive narrative, business interpretation, and behavior
+    narrative via Gemini. Returns a dict of overrides to merge into the
+    deterministic report; missing keys mean 'keep the deterministic version'."""
+    if not HAS_GEMINI:
+        return {"llm_provider": "deterministic", "llm_model": None}
+
+    # Slim payload — only the facts needed for narration. Avoids leaking SHAP
+    # arrays into the prompt and keeps token usage low.
+    facts = {
+        "executive": {
+            "model": report["executive"].get("model"),
+            "auc": report["executive"].get("auc"),
+            "eo_gap": report["executive"].get("eo_gap"),
+            "status": report["executive"].get("status"),
+        },
+        "fairness_risk": {
+            "severity": report["fairness_risk"].get("severity"),
+            "primary_bias_type": report["fairness_risk"].get("primary_bias_type"),
+            "diagnoses_agree": report["fairness_risk"].get("diagnoses_agree"),
+            "disadvantaged_groups": report["fairness_risk"].get("disadvantaged_groups"),
+        },
+        "model_behavior": {
+            "top_features": report["model_behavior"].get("top_features"),
+            "proxy_features": report["model_behavior"].get("proxy_features"),
+            "shap_available": report["model_behavior"].get("shap_available"),
+        },
+        "actions": {
+            "diagnosis": report["actions"].get("diagnosis"),
+            "recommended_count": report["actions"].get("recommended_count"),
+            "blocked_count": report["actions"].get("blocked_count"),
+            "safe_to_auto_fix": report["actions"].get("safe_to_auto_fix"),
+        },
+        "deployment": {
+            "verdict": report["deployment"].get("verdict"),
+            "passed_count": report["deployment"].get("passed_count"),
+            "total_conditions": report["deployment"].get("total_conditions"),
+        },
+    }
+    prompt = (
+        "Below is a fairness-audit decision report. Generate ONE JSON object with these "
+        "exact keys (each value a 2–4 sentence string):\n"
+        "  executive_narrative — overall plain-English headline a CEO/PM could read in 30s.\n"
+        "  business_interpretation — risk + suitability framing for regulated decision systems.\n"
+        "  behavior_narrative — what the model relies on, including any proxy concern, in plain language.\n"
+        "  deployment_rationale — why the verdict was reached, citing the failing/passing checkpoints.\n"
+        "Return ONLY the JSON, no markdown, no prose outside it.\n\n"
+        f"DATA:\n{json.dumps(facts, default=str)}"
+    )
+    text = _gemini_narrate(prompt, system=_S8_SYSTEM_PROMPT, max_chars=4000)
+    if not text:
+        return {"llm_provider": "deterministic", "llm_model": None}
+
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").lstrip("json").strip()
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return {"llm_provider": "deterministic", "llm_model": None}
+
+    return {
+        "executive_narrative": parsed.get("executive_narrative") if isinstance(parsed.get("executive_narrative"), str) else None,
+        "business_interpretation": parsed.get("business_interpretation") if isinstance(parsed.get("business_interpretation"), str) else None,
+        "behavior_narrative": parsed.get("behavior_narrative") if isinstance(parsed.get("behavior_narrative"), str) else None,
+        "deployment_rationale": parsed.get("deployment_rationale") if isinstance(parsed.get("deployment_rationale"), str) else None,
+        "llm_provider": "gemini",
+        "llm_model": GEMINI_MODEL,
+    }
+
+
+@app.post("/api/audit/stage/8")
+def stage_8():
+    """Decision-intelligence report layer. Aggregates all prior stages into
+    five tabs: Executive · Fairness & Risk · Model Behavior · Actions · Deployment.
+    LLM narratives (via Gemini) are layered on top of the deterministic numbers
+    when an API key is configured; otherwise the deterministic templates ship."""
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id")
+    if not session_id:
+        return jsonify({"error": "missing session_id"}), 400
+
+    s1 = payload.get("stage1") or {}
+    s4 = payload.get("stage4") or {}
+    s5 = payload.get("stage5") or {}
+    s6 = payload.get("stage6") or {}
+    s7 = payload.get("stage7") or {}
+
+    report = {
+        "session_id": session_id,
+        "executive": _stage8_executive(s7),
+        "fairness_risk": _stage8_fairness_risk(s1, s5, s7),
+        "model_behavior": _stage8_model_behavior(s5),
+        "actions": _stage8_actions(s6, s7),
+        "deployment": _stage8_deployment(s7),
+    }
+
+    # Layer Gemini narratives on top — these REPLACE the corresponding template
+    # strings when present. Numbers and verdicts are untouched.
+    llm = _stage8_llm_narratives(report)
+    if llm.get("business_interpretation"):
+        report["executive"]["business_interpretation"] = llm["business_interpretation"]
+    if llm.get("behavior_narrative"):
+        report["model_behavior"]["narrative"] = llm["behavior_narrative"]
+    if llm.get("deployment_rationale"):
+        report["deployment"]["verdict_text"] = llm["deployment_rationale"]
+    report["executive_narrative"] = llm.get("executive_narrative")  # may be None
+    report["llm_provider"] = llm.get("llm_provider", "deterministic")
+    report["llm_model"] = llm.get("llm_model")
+
+    return jsonify(report)
 
 
 if __name__ == "__main__":
